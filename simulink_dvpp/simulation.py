@@ -281,7 +281,9 @@ class SimulinkDVPP6DOF:
             mass,
             -rigid_body_coriolis(nu, total_mass=self.mass) @ nu - forces.radiation + forces.total_without_radiation_sign(),
         )
+        nu_dot[5] = 0.0   # 5-DOF: no yaw acceleration
         eta_dot = body_to_ned_velocity(nu, eta)
+        eta_dot[5] = 0.0  # 5-DOF: suppress kinematic psi_dot from roll/pitch coupling
         self._check_finite("state derivative", nu_dot)
         self._check_finite("kinematics", eta_dot)
         _ = sail_outputs
