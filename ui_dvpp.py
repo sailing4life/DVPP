@@ -314,11 +314,12 @@ with tab2:
                 default_fly = (
                     next((i for i, h in enumerate(flying) if h.sail_id == st.session_state.headsail_id), 0)
                 )
-                sel_fly = st.selectbox("Flying headsail (C0)", fly_labels, index=default_fly)
+                sel_fly = st.selectbox("Flying headsail / gennaker", fly_labels, index=default_fly)
                 chosen_fly = flying[fly_labels.index(sel_fly)]
                 st.session_state.headsail_id = chosen_fly.sail_id
                 headsail_geom = chosen_fly
-                st.caption(f"Area: {chosen_fly.sail_area:.1f} m²  ·  Luff: {chosen_fly.JIBLUFF:.2f} m")
+                luff = getattr(chosen_fly, "JIBLUFF", None) or getattr(chosen_fly, "SLU", 0.0)
+                st.caption(f"Area: {chosen_fly.sail_area:.1f} m²  ·  Luff: {luff:.2f} m")
         else:
             st.caption("No DXT loaded — using default IMOCA 60 dimensions (J1.5 / A6.5).")
 

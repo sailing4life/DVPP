@@ -48,6 +48,25 @@ class HeadsailGeom:
 
 
 @dataclass
+class AsymSpinGeom:
+    """Asymmetric spinnaker geometry extracted from an ORC DXT asym_spin record."""
+    sail_id: str
+    SLU: float      # spinnaker luff (m)
+    SLE: float      # spinnaker leech (m)
+    ASL: float      # asymmetric half-width / mid length (m)
+    AMG: float      # maximum girth (m)
+    ASF: float      # foot girth / spread (m)
+    sail_area: float
+    comment: str = ""
+
+    def label(self):
+        parts = [self.sail_id, f"{self.sail_area:.0f} m²", "asym spin"]
+        if self.comment:
+            parts.append(self.comment)
+        return "  ·  ".join(parts)
+
+
+@dataclass
 class ORCRig:
     """Parsed ORC DXT certificate — rig dimensions and sail inventory."""
     yacht_name: str
@@ -60,14 +79,15 @@ class ORCRig:
     J: float
     mainsail: MainsailGeom
     headsails: list = field(default_factory=list)
+    asym_spinners: list = field(default_factory=list)
 
     def jibs(self):
         """Non-flying jib headsails."""
         return [h for h in self.headsails if not h.is_flying]
 
     def flying_headsails(self):
-        """Flying headsails (code zeros, A-sails)."""
-        return [h for h in self.headsails if h.is_flying]
+        """Flying headsails (code zeros, A-sails) and asymmetric spinnakers combined."""
+        return [h for h in self.headsails if h.is_flying] + self.asym_spinners
 
 
 def _fval(elem, fieldname, default=0.0):
@@ -165,10 +185,25 @@ def parse_dxt(source):
             comment=_sval(r, "Comment"),
         ))
 
+    # ── Asymmetric spinnakers ─────────────────────────────────────────────────
+    asym_spinners = []
+    for r in inp.findall(".//SAIL[@SailCode='asym_spin']/RECORD"):
+        asym_spinners.append(AsymSpinGeom(
+            sail_id=_sval(r, "SailId"),
+            SLU=_fval(r, "SLU"),
+            SLE=_fval(r, "SLE"),
+            ASL=_fval(r, "ASL"),
+            AMG=_fval(r, "AMG"),
+            ASF=_fval(r, "ASF"),
+            sail_area=_fval(r, "SailArea"),
+            comment=_sval(r, "Comment"),
+        ))
+
     return ORCRig(
         yacht_name=sv("YachtName"),
         cert_no=sv("CertNo"),
         P=P, E=E, BAS=BAS, IG=IG, ISP=ISP, J=J,
         mainsail=mainsail,
         headsails=headsails,
+        asym_spinners=asym_spinners,
     )

@@ -11,8 +11,9 @@ from .types import SailInputs, SailOutputs
 
 # Lazy import to avoid hard dependency on orc_dxt at module load
 try:
-    from orc_dxt import HeadsailGeom, MainsailGeom
+    from orc_dxt import AsymSpinGeom, HeadsailGeom, MainsailGeom
 except ImportError:
+    AsymSpinGeom = None
     HeadsailGeom = None
     MainsailGeom = None
 
@@ -189,17 +190,40 @@ def jib_force(aws, eta, nu, reef, flat, c0_enabled, geom=None):
 
 
 def flying_headsail_force(aws, eta, nu, flat, c0_enabled, awa_old, geom=None):
-    if geom is not None:
+    # ── Geometry extraction ───────────────────────────────────────────────────
+    # AsymSpinGeom (big gennakers: A2, A2.2, …) use a different set of ORC
+    # measurement fields.  They are mapped to the same headsail aerodynamic table
+    # using the equivalent parameters:
+    #   ratio  = AMG / ASF × 100   (max girth / foot, same role as JGM/LPG)
+    #   area   = measured SA from certificate (most accurate)
+    #   CEH    = [0.5·ASF, 0, 0.40·SLU]  (higher centroid than a code zero)
+    #   a22    = π/4 · ρ · AMG² · SLU   (consistent with headsail formula)
+    if AsymSpinGeom is not None and isinstance(geom, AsymSpinGeom):
+        hlu   = geom.SLU
+        hlp   = geom.ASF
+        hhw   = geom.AMG
+        ratio = hhw / hlp * 100.0
+        area_c0 = geom.sail_area
+        ceh = _rotation_from_eta(eta) @ np.array([0.5 * hlp, 0.0, 0.40 * hlu])
+        a22_c0 = np.pi / 4.0 * AIR_DENSITY * hhw**2 * hlu
+    elif geom is not None:
+        # HeadsailGeom — code zeros, A-sails, J0, FR0, …
         hhb = geom.JH;  huw = geom.JGT; htw = geom.JGU
         hhw = geom.JGM; hqw = geom.JGL; hlp = geom.LPG; hlu = geom.JIBLUFF
+        ratio = hhw / hlp * 100.0
+        area_c0 = 0.1125 * hlu * (1.445 * hlp + 2.0 * hqw + 2.0 * hhw + 1.5 * htw + huw + 0.5 * hhb)
+        ceh = _rotation_from_eta(eta) @ np.array([0.5 * hlp, 0.0, 0.25 * hlu])
+        a22_c0 = np.pi / 4.0 * AIR_DENSITY * hhw**2 * hlu
     else:
+        # defaults (A6.5)
         hhb = 0.11;  huw = 2.80;  htw = 5.49
         hhw = 10.64; hqw = 15.0;  hlp = 18.21; hlu = 25.33
+        ratio = hhw / hlp * 100.0
+        area_c0 = 0.1125 * hlu * (1.445 * hlp + 2.0 * hqw + 2.0 * hhw + 1.5 * htw + huw + 0.5 * hhb)
+        ceh = _rotation_from_eta(eta) @ np.array([0.5 * hlp, 0.0, 0.25 * hlu])
+        a22_c0 = np.pi / 4.0 * AIR_DENSITY * hhw**2 * hlu
 
-    ratio = hhw / hlp * 100.0
-    area_c0 = 0.1125 * hlu * (1.445 * hlp + 2.0 * hqw + 2.0 * hhw + 1.5 * htw + huw + 0.5 * hhb)
-    ceh = _rotation_from_eta(eta) @ np.array([0.5 * hlp, 0.0, 0.25 * hlu])
-
+    # ── Aerodynamics (ORC headsail Cl/Cd table, parameterised by ratio & AWA) ─
     angular = np.asarray(nu[3:6], dtype=float)
     aws_sail = np.asarray(aws, dtype=float) + np.cross(angular, ceh)
     awa_deg = np.rad2deg(np.arctan2(aws_sail[1], aws_sail[0]))
@@ -214,7 +238,6 @@ def flying_headsail_force(aws, eta, nu, flat, c0_enabled, awa_old, geom=None):
     force, _ = _compose_sail_force(aws_sail, ceh, area_c0, AIR_DENSITY, cl, cd, awa_lookup)
     force = force * float(c0_enabled)
 
-    a22_c0 = np.pi / 4.0 * AIR_DENSITY * hhw**2 * hlu
     a44_c0 = a22_c0 * ceh[2] ** 2
     return _SailComponent(force=force, area=float(area_c0), a22=float(a22_c0), a44=float(a44_c0), awa_deg=float(awa_lookup), factor=float(factor))
 
