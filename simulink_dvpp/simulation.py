@@ -92,11 +92,14 @@ def load_hull_geometry(hull_file, waterline_z=None, mass=SIMULINK_DISPLACEMENT_K
 
 
 class SimulinkDVPP6DOF:
-    def __init__(self, hull_file, dt=0.05, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG):
+    def __init__(self, hull_file, dt=0.05, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG,
+                 mainsail_geom=None, jib_geom=None, headsail_geom=None, radiation_data=None):
         self.dt = float(dt)
         self.vertices, self.faces, self.waterline_z = load_hull_geometry(hull_file, waterline_z=waterline_z, mass=mass)
         self.radiation = CumminsRadiationModel(dt=dt)
-        self.sails = SailModel()
+        if radiation_data is not None:
+            self.radiation.inject_solver_data(**radiation_data)
+        self.sails = SailModel(mainsail_geom=mainsail_geom, jib_geom=jib_geom, headsail_geom=headsail_geom)
         self.mass = float(mass)
         self.zero = 0.0
 
@@ -397,5 +400,9 @@ def run_simulation(**kwargs):
         dt=dt,
         waterline_z=kwargs.pop("waterline_z", None),
         mass=kwargs.pop("mass", SIMULINK_DISPLACEMENT_KG),
+        mainsail_geom=kwargs.pop("mainsail_geom", None),
+        jib_geom=kwargs.pop("jib_geom", None),
+        headsail_geom=kwargs.pop("headsail_geom", None),
+        radiation_data=kwargs.pop("radiation_data", None),
     )
     return sim.simulate(**kwargs)

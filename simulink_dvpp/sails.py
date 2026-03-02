@@ -9,6 +9,13 @@ from .constants import AIR_DENSITY, GRAVITY
 from .helpers import DelayLine, bilinear_interp, clamp_interp
 from .types import SailInputs, SailOutputs
 
+# Lazy import to avoid hard dependency on orc_dxt at module load
+try:
+    from orc_dxt import HeadsailGeom, MainsailGeom
+except ImportError:
+    HeadsailGeom = None
+    MainsailGeom = None
+
 
 _AWA_LOOKUP = np.array([0.0, 7.0, 9.0, 12.0, 28.0, 60.0, 90.0, 120.0, 150.0, 180.0], dtype=float)
 _MAIN_CD = np.array([0.03448, 0.01724, 0.01466, 0.01466, 0.02586, 0.11302, 0.38250, 0.96888, 1.31578, 1.34483], dtype=float)
@@ -92,14 +99,13 @@ def _compose_sail_force(aws_body, ceh, area, rho, cl, cd, awa_deg):
     ], dtype=float), aws_norm
 
 
-def mainsail_force(aws, eta, nu, reef, flat, awa_old):
-    mhb = 3.19
-    muw = 3.77
-    mtw = 4.85
-    mhw = 6.54
-    mqw = 7.56
-    e = 7.636
-    p = 26.522
+def mainsail_force(aws, eta, nu, reef, flat, awa_old, geom=None):
+    if geom is not None:
+        mhb = geom.HB;  muw = geom.MGT; mtw = geom.MGU
+        mhw = geom.MGM; mqw = geom.MGL; e = geom.E; p = geom.P
+    else:
+        mhb = 3.19;  muw = 3.77;  mtw = 4.85
+        mhw = 6.54;  mqw = 7.56;  e = 7.636;  p = 26.522
 
     mhwh = p / 2.0 + (mhw - e / 2.0) / p * e
     mqwh = mhwh / 2.0 + (mqw - (e + mhw) / 2.0) / mhwh * (e - mhw)
@@ -157,14 +163,13 @@ def mainsail_force(aws, eta, nu, reef, flat, awa_old):
     return _SailComponent(force=force, area=float(area_m), a22=float(a22_ms), a44=float(a44_ms), awa_deg=float(awa_lookup))
 
 
-def jib_force(aws, eta, nu, reef, flat, c0_enabled):
-    hhb = 0.14
-    huw = 1.54
-    htw = 2.94
-    hhw = 5.86
-    hqw = 8.91
-    hlp = 12.17
-    hlu = 24.72
+def jib_force(aws, eta, nu, reef, flat, c0_enabled, geom=None):
+    if geom is not None:
+        hhb = geom.JH;  huw = geom.JGT; htw = geom.JGU
+        hhw = geom.JGM; hqw = geom.JGL; hlp = geom.LPG; hlu = geom.JIBLUFF
+    else:
+        hhb = 0.14;  huw = 1.54;  htw = 2.94
+        hhw = 5.86;  hqw = 8.91;  hlp = 12.17;  hlu = 24.72
 
     area_jib = 0.1125 * hlu * (1.445 * hlp + 2.0 * hqw + 2.0 * hhw + 1.5 * htw + huw + 0.5 * hhb) * reef
     ceh = _rotation_from_eta(eta) @ np.array([0.5 * hlp, 0.0, 0.5 * hlu]) * reef
@@ -183,14 +188,13 @@ def jib_force(aws, eta, nu, reef, flat, c0_enabled):
     return _SailComponent(force=force, area=float(area_jib), a22=float(a22_jib), a44=float(a44_jib), awa_deg=float(awa_deg))
 
 
-def flying_headsail_force(aws, eta, nu, flat, c0_enabled, awa_old):
-    hhb = 0.11
-    huw = 2.80
-    htw = 5.49
-    hhw = 10.64
-    hqw = 15.0
-    hlp = 18.21
-    hlu = 25.33
+def flying_headsail_force(aws, eta, nu, flat, c0_enabled, awa_old, geom=None):
+    if geom is not None:
+        hhb = geom.JH;  huw = geom.JGT; htw = geom.JGU
+        hhw = geom.JGM; hqw = geom.JGL; hlp = geom.LPG; hlu = geom.JIBLUFF
+    else:
+        hhb = 0.11;  huw = 2.80;  htw = 5.49
+        hhw = 10.64; hqw = 15.0;  hlp = 18.21; hlu = 25.33
 
     ratio = hhw / hlp * 100.0
     area_c0 = 0.1125 * hlu * (1.445 * hlp + 2.0 * hqw + 2.0 * hhw + 1.5 * htw + huw + 0.5 * hhb)
@@ -258,20 +262,33 @@ def added_mass_sails(main, jib, flying, c0_enabled):
 class SailModel:
     """
     Port of the full Simulink sail-force subsystem, including 40-sample AWA delays.
+
+    Parameters
+    ----------
+    mainsail_geom : MainsailGeom or None
+        Mainsail geometry from a parsed ORC DXT file.  None uses the default
+        IMOCA 60 hardcoded dimensions.
+    jib_geom : HeadsailGeom or None
+        Non-flying jib geometry.  None defaults to J1.5 dimensions.
+    headsail_geom : HeadsailGeom or None
+        Flying headsail (C0) geometry.  None defaults to A6.5 dimensions.
     """
 
-    def __init__(self, delay_length=40):
+    def __init__(self, delay_length=40, mainsail_geom=None, jib_geom=None, headsail_geom=None):
         self.main_awa_delay = DelayLine(delay_length, initial_value=0.0)
         self.headsail_awa_delay = DelayLine(delay_length, initial_value=0.0)
+        self.mainsail_geom = mainsail_geom
+        self.jib_geom = jib_geom
+        self.headsail_geom = headsail_geom
 
     def reset(self):
         self.main_awa_delay.reset()
         self.headsail_awa_delay.reset()
 
     def evaluate(self, inputs: SailInputs):
-        main = mainsail_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.reef, inputs.flat, self.main_awa_delay.read())
-        jib = jib_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.reef, inputs.flat, inputs.c0_enabled)
-        flying = flying_headsail_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.flat, inputs.c0_enabled, self.headsail_awa_delay.read())
+        main = mainsail_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.reef, inputs.flat, self.main_awa_delay.read(), geom=self.mainsail_geom)
+        jib = jib_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.reef, inputs.flat, inputs.c0_enabled, geom=self.jib_geom)
+        flying = flying_headsail_force(inputs.aws_body, inputs.eta, inputs.nu, inputs.flat, inputs.c0_enabled, self.headsail_awa_delay.read(), geom=self.headsail_geom)
         windage = windage_force(flying.area, main.area, jib.area, inputs.aws_body, inputs.reef, inputs.twa_deg)
         spi = spi_force(inputs.spi_force)
         total = main.force + jib.force + flying.force + windage + spi

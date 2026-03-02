@@ -134,6 +134,16 @@ class CumminsRadiationModel:
         self.velocity_history = np.zeros((6, len(self.timerange)))
         self.kernel_cache = {}
 
+    def inject_solver_data(self, B_omega, A_omega, A_inf, omega):
+        """Replace NEMOH coefficients with panel-solver results (strip theory or BEM)."""
+        self.omega = np.asarray(omega, dtype=float)
+        self.A = symmetrize_matrix_slices(np.asarray(A_omega, dtype=float))
+        self.B = project_psd_slices(np.asarray(B_omega, dtype=float))
+        self.A_inf = project_psd_matrix(np.asarray(A_inf, dtype=float))
+        # Rebuild timerange to match the new dt (unchanged) but flush the kernel
+        # cache so it is recomputed against the new B and A_inf values.
+        self.kernel_cache.clear()
+
     def reset(self):
         self.velocity_history.fill(0.0)
         self.kernel_cache.clear()

@@ -90,7 +90,8 @@ def foil_gravity_force(points, eta, chord_length, rho_foil=1750.0):
 def _foil_lift_slope_correction(aspect_ratio):
     slope_cl = np.diff(_FOIL_CL[4:-4]).mean() / np.diff(_FOIL_ALPHA[4:-4]).mean() * (180.0 / np.pi)
     if aspect_ratio <= 4.0:
-        corrected_slope = slope_cl / np.sqrt(1.0 + (slope_cl / (np.pi * 0.9 * aspect_ratio) ** 2) + (slope_cl / (np.pi * 0.9 * aspect_ratio)))
+        ar_term = slope_cl / (np.pi * 0.9 * max(aspect_ratio, 1e-9))
+        corrected_slope = slope_cl / np.sqrt(1.0 + ar_term ** 2 + ar_term)
     else:
         corrected_slope = slope_cl / (1.0 + slope_cl / (np.pi * 0.9 * aspect_ratio))
     return corrected_slope / slope_cl

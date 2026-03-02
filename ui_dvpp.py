@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from panel_solver   import PanelSolver
 from simulink_dvpp import SIMULINK_DISPLACEMENT_KG, run_simulation
 from simulink_dvpp.radiation import DEFAULT_OMEGA as _NEMOH_OMEGA, DEFAULT_B33 as _NEMOH_B33
+from orc_dxt import parse_dxt
 from validate_sphere import _retardation_kernel, _simulate_cummins, _analytical_drop
 from simulink_dvpp.radiation import A_INF as _NEMOH_A_INF
 
@@ -54,6 +55,9 @@ for key, default in [
     ('drop_done',    False),
     ('drop_results', None),
     ('capytaine_python', os.environ.get('CAPYTAINE_PYTHON', '')),
+    ('orc_rig',      None),
+    ('jib_id',       None),
+    ('headsail_id',  None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -269,6 +273,55 @@ with tab2:
         Flat = st.slider("Flat factor", 0.0, 1.0, 1.0, step=0.05)
         C0_enabled = st.checkbox("Flying headsail (C0)", value=False)
 
+        st.markdown("---")
+        st.markdown("**ORC sail inventory**")
+        dxt_file = st.file_uploader("Upload DXT certificate", type=["dxt", "xml"],
+                                    help="ORC DXT certificate — extracts actual sail dimensions.")
+        if dxt_file is not None:
+            try:
+                rig = parse_dxt(dxt_file)
+                st.session_state.orc_rig = rig
+                # Reset selections when a new file is loaded
+                st.session_state.jib_id = None
+                st.session_state.headsail_id = None
+                st.caption(f"Loaded: **{rig.yacht_name}** (cert {rig.cert_no})")
+            except Exception as e:
+                st.error(f"Could not parse DXT: {e}")
+
+        rig = st.session_state.orc_rig
+        jib_geom = None
+        headsail_geom = None
+        mainsail_geom = None
+
+        if rig is not None:
+            mainsail_geom = rig.mainsail
+
+            jibs = rig.jibs()
+            if jibs:
+                jib_labels = [h.label() for h in jibs]
+                default_jib = (
+                    next((i for i, h in enumerate(jibs) if h.sail_id == st.session_state.jib_id), 0)
+                )
+                sel_jib = st.selectbox("Non-flying jib", jib_labels, index=default_jib)
+                chosen_jib = jibs[jib_labels.index(sel_jib)]
+                st.session_state.jib_id = chosen_jib.sail_id
+                jib_geom = chosen_jib
+                st.caption(f"Area: {chosen_jib.sail_area:.1f} m²  ·  Luff: {chosen_jib.JIBLUFF:.2f} m")
+
+            flying = rig.flying_headsails()
+            if flying:
+                fly_labels = [h.label() for h in flying]
+                default_fly = (
+                    next((i for i, h in enumerate(flying) if h.sail_id == st.session_state.headsail_id), 0)
+                )
+                sel_fly = st.selectbox("Flying headsail (C0)", fly_labels, index=default_fly)
+                chosen_fly = flying[fly_labels.index(sel_fly)]
+                st.session_state.headsail_id = chosen_fly.sail_id
+                headsail_geom = chosen_fly
+                st.caption(f"Area: {chosen_fly.sail_area:.1f} m²  ·  Luff: {chosen_fly.JIBLUFF:.2f} m")
+        else:
+            st.caption("No DXT loaded — using default IMOCA 60 dimensions (J1.5 / A6.5).")
+
     with col_app2:
         st.subheader("Appendages")
         use_foil    = st.checkbox("Deploy leeward foil", value=True)
@@ -285,6 +338,31 @@ with tab2:
             value=float(st.session_state.mass_kg),
             step=100.0,
         )
+
+        st.markdown("**Radiation / Cummins source**")
+        rad_options = ["Original Simulink (NEMOH)"]
+        if st.session_state.solver_done:
+            rad_options.append("Panel Solver (strip theory / BEM)")
+        rad_source = st.radio(
+            "Hydrodynamic coefficients",
+            rad_options,
+            index=0,
+            help="Choose which B(ω), A(ω) and A_inf feed the Cummins radiation equation. "
+                 "Run the Panel Solver first to unlock the second option.",
+        )
+        if rad_source.startswith("Panel") and st.session_state.solver_done:
+            _s = st.session_state.solver
+            radiation_data = dict(
+                B_omega=_s.B_omega,
+                A_omega=_s.A_omega,
+                A_inf=_s.A_inf,
+                omega=_s.omega,
+            )
+            st.caption(f"Using panel-solver coefficients ({len(_s.omega)} freq. points).")
+        else:
+            radiation_data = None
+            if not st.session_state.solver_done:
+                st.caption("Run the Panel Solver (Tab 1) to enable its coefficients here.")
 
     with st.expander("Initial Conditions", expanded=False):
         col_eta0, col_nu0 = st.columns(2)
@@ -383,6 +461,10 @@ with tab2:
                     wave_ramp     = float(wave_ramp),
                     wave_angle_deg= float(wave_angle_deg),
                     wave_wind_speed_kn = float(wave_wind_speed_kn),
+                    mainsail_geom = mainsail_geom,
+                    jib_geom      = jib_geom,
+                    headsail_geom = headsail_geom,
+                    radiation_data= radiation_data,
                 )
                 elapsed = time.time() - t0
                 st.session_state.t_vals  = sim_outputs.t_vals
