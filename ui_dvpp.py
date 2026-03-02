@@ -326,7 +326,7 @@ with tab2:
     with col_app2:
         st.subheader("Appendages")
         use_foil    = st.checkbox("Deploy leeward foil", value=True)
-        foil_cant   = st.slider("Foil rake angle [°]", 0, 60, 40)
+        foil_cant   = st.slider("Foil rake angle [°]", 0, 10, 4)
         keel_angle_deg = st.slider("Keel cant angle [°]", -45, 45, 0)
         st.caption("The translated Simulink path currently keeps the rudder branch at zero, matching the source model wiring.")
 
@@ -339,6 +339,24 @@ with tab2:
             value=float(st.session_state.mass_kg),
             step=100.0,
         )
+
+        st.markdown("**Resistance model**")
+        _res_options = {
+            "DSYHS + Savitsky blend (mode 4, default)": 4,
+            "DSYHS only (mode 3)": 3,
+            "MaxSURF lookup table (mode 2)": 2,
+            "Savitsky planing (mode 1)": 1,
+        }
+        _res_label = st.selectbox(
+            "Resistance formula",
+            list(_res_options.keys()),
+            index=0,
+            help="Mode 4: DSYHS (Fn ≤ 0.61) blended with Savitsky planing (Fn ≥ 0.74). "
+                 "Mode 3: DSYHS regression only. "
+                 "Mode 2: MaxSURF speed → resistance lookup table. "
+                 "Mode 1: Savitsky planing formula only.",
+        )
+        resistance_mode = _res_options[_res_label]
 
         st.markdown("**Radiation / Cummins source**")
         rad_options = ["Original Simulink (NEMOH)"]
@@ -465,7 +483,8 @@ with tab2:
                     mainsail_geom = mainsail_geom,
                     jib_geom      = jib_geom,
                     headsail_geom = headsail_geom,
-                    radiation_data= radiation_data,
+                    radiation_data    = radiation_data,
+                    resistance_mode  = resistance_mode,
                 )
                 elapsed = time.time() - t0
                 st.session_state.t_vals  = sim_outputs.t_vals

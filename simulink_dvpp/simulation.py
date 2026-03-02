@@ -93,7 +93,8 @@ def load_hull_geometry(hull_file, waterline_z=None, mass=SIMULINK_DISPLACEMENT_K
 
 class SimulinkDVPP6DOF:
     def __init__(self, hull_file, dt=0.05, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG,
-                 mainsail_geom=None, jib_geom=None, headsail_geom=None, radiation_data=None):
+                 mainsail_geom=None, jib_geom=None, headsail_geom=None, radiation_data=None,
+                 resistance_mode=4):
         self.dt = float(dt)
         self.vertices, self.faces, self.waterline_z = load_hull_geometry(hull_file, waterline_z=waterline_z, mass=mass)
         self.radiation = CumminsRadiationModel(dt=dt)
@@ -102,6 +103,7 @@ class SimulinkDVPP6DOF:
         self.sails = SailModel(mainsail_geom=mainsail_geom, jib_geom=jib_geom, headsail_geom=headsail_geom)
         self.mass = float(mass)
         self.zero = 0.0
+        self.resistance_mode = int(resistance_mode)
 
     @staticmethod
     def _check_finite(label, values):
@@ -207,7 +209,7 @@ class SimulinkDVPP6DOF:
             awa_deg=awa_deg,
             submerged_area=hydro.submerged_facet_areas,
             a_array=resistance_coeffs,
-            mode=4,
+            mode=self.resistance_mode,
         )
         # res_hs is buoyancy force in N (≈ displacement × g ≈ 122 kN at design).
         # The radiation/diffraction scaling formula uses this to normalise to a
@@ -404,5 +406,6 @@ def run_simulation(**kwargs):
         jib_geom=kwargs.pop("jib_geom", None),
         headsail_geom=kwargs.pop("headsail_geom", None),
         radiation_data=kwargs.pop("radiation_data", None),
+        resistance_mode=kwargs.pop("resistance_mode", 4),
     )
     return sim.simulate(**kwargs)

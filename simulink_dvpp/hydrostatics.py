@@ -120,10 +120,15 @@ def hydrostatic_forces_and_moments(vertices, faces, eta, time, zero, wave):
         LCB = float(np.sum(facet_areas[submerged] * submerged_centers_body[:, 0]) / np.sum(facet_areas[submerged]) + fpp)
         LCF = float(waterplane_centroid[0] + fpp)
     else:
-        LWL = 0.2
-        WB = 0.05
-        LCB = 1.0
-        LCF = 1.0
+        # Fewer than 20 panels submerged — boat is nearly out of the water.
+        # Use conservative minimum values so that the Delft DSYHS prismatic
+        # coefficient  cp = Δ / (LWL · Bwl · T)  stays bounded.
+        # Tiny LWL / WB (old: 0.2 / 0.05) drove cp → thousands, making the
+        # resistance coefficient hugely negative → unphysical thrust → crash.
+        LWL = 4.0
+        WB  = 0.5
+        LCB = 7.0
+        LCF = 7.5
         Draft = 0.0
 
     hydrostatic_force_x = np.sum(hydrostatic_pressure[submerged] * facet_areas[submerged] * facet_normals_body[submerged, 0])
