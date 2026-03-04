@@ -40,7 +40,7 @@ _FOIL_POINTS_ONSIDE = np.array([
     [1.609166, -6.825013, 1.520682],
     [1.609166, -6.911797, 1.812046],
 ], dtype=float)
-# z-values are in raw STL coordinates; wl_z_shift = -waterline_z is applied at call time in foil_forces()
+_FOIL_POINTS_ONSIDE[:, 2] += 0.406
 
 
 @dataclass
