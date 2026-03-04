@@ -65,7 +65,11 @@ def resistance_force(eta, eta_d, hydrostat, LWL, WB, awa_deg, submerged_area, a_
                 12.600, 13.200, 13.800, 14.400, 15.000, 15.600, 16.200, 16.800,
                 17.400, 18.100, 18.700, 19.300, 20.000, 20.700, 21.300,
             ])
-            D = np.interp(U, speeds, res) * 1000.0
+            # Enforce monotonicity: resistance must not decrease with speed on a
+            # displacement hull.  The raw MaxSURF table has a planing-hull dip
+            # from ~10.5 kn onward (artefact of hull/software settings) that
+            # allows unrealistically low resistance above hull speed.
+            D = np.interp(U, speeds, np.maximum.accumulate(res)) * 1000.0
         elif mode == 3:
             Tc = Draft
             Cm = 0.85
@@ -80,6 +84,14 @@ def resistance_force(eta, eta_d, hydrostat, LWL, WB, awa_deg, submerged_area, a_
             ) * (displacement**(1.0 / 3.0) / max(LWL, 1e-9))
             D = displacement * rho * g * Cr_dsyhs + (Sw / Sw0) * Cf * 0.5 * rho * U**2 * Sw
         elif mode == 4:
+            # DSYHS (Delft Systematic Yacht Hull Series) displacement-mode model.
+            # The original Savitsky blending above Fn=0.61 has been removed: Savitsky
+            # assumes the hull is planing (lifted out of the water by dynamic pressure),
+            # which never occurs on an IMOCA 60 sailing in displacement mode.  Using
+            # Savitsky gave unrealistically LOW resistance above hull speed and allowed
+            # the VPP to converge at >20 kn reaching — physically impossible without foils.
+            # Pure DSYHS gives monotonically increasing D via the friction term (∝ U²)
+            # and is the most appropriate displacement-mode model available here.
             Tc = Draft
             Cm = 0.85
             Cr_dsyhs = a0 + (
@@ -94,14 +106,17 @@ def resistance_force(eta, eta_d, hydrostat, LWL, WB, awa_deg, submerged_area, a_
 
             if fn < 0.15:
                 D = 0.0
-            elif fn <= 0.61:
-                D = displacement * rho * g * Cr_dsyhs + (Sw / Sw0) * Cf * 0.5 * rho * U**2 * Sw
-            elif 0.61 < fn < 0.74:
-                savitsky = Dis * np.tan(tau) + (rho * V1**2 * Cf * A * B**2) / (2.0 * np.cos(beta) * np.cos(tau)) * ((fn - 0.6) / 0.15)
-                dsyhs = (displacement * rho * g * Cr_dsyhs + (Sw / Sw0) * Cf * 0.5 * rho * U**2 * Sw) * (-(fn - 0.75) / 0.15)
-                D = savitsky + dsyhs
             else:
-                D = Dis * np.tan(tau) + (rho * V1**2 * Cf * A * B**2) / (2.0 * np.cos(beta) * np.cos(tau))
+                D = displacement * rho * g * Cr_dsyhs + (Sw / Sw0) * Cf * 0.5 * rho * U**2 * Sw
+
+    # ── Heel resistance correction ────────────────────────────────────────────
+    # An heeled hull presents a distorted waterplane that increases residuary
+    # resistance.  From Horel (2019) Table 1 / ORC VPP §6 methodology:
+    #   R_heeled = R_upright × (1 + β_h × sin²φ)   with β_h ≈ 0.9
+    # At φ = 35° (typical upwind heel): factor ≈ 1.296 (+30%).
+    phi = float(eta[3])   # heel angle [rad]; positive = heeled to starboard
+    beta_h = 0.9
+    D = D * (1.0 + beta_h * np.sin(phi) ** 2)
 
     # Hull aerodynamic windage is already handled in the sail subsystem.
     # Keep the resistance block hydrodynamic so loads are not double-counted.
