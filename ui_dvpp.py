@@ -199,7 +199,6 @@ def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0
     eta = np.asarray(eta, dtype=float)
     translation = eta[:3]
     R = body_to_world_rotation(eta)
-    wl_shift = -waterline_z
 
     def body_to_world(pts_body):
         pts = np.asarray(pts_body, dtype=float)
@@ -208,6 +207,8 @@ def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0
     fig = go.Figure()
 
     # ── 1. Hull mesh ──────────────────────────────────────────────────────────
+    # Hull vertices are already in the simulator body frame (waterline = z=0)
+    # after load_hull_geometry applies -waterline_z shift.
     try:
         verts, faces, _ = load_hull_geometry(hull_path, waterline_z=waterline_z, mass=mass_kg)
         verts_w = body_to_world(verts)
@@ -220,28 +221,27 @@ def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0
     except Exception:
         pass
 
-    # ── 2. Waterline plane ────────────────────────────────────────────────────
-    half = 8.0
-    wl_corners_body = np.array([
-        [-half, -half, 0.0],
-        [ half, -half, 0.0],
-        [ half,  half, 0.0],
-        [-half,  half, 0.0],
-    ])
-    wl_w = body_to_world(wl_corners_body)
+    # ── 2. Waterline plane (horizontal in world frame) ────────────────────────
+    # The water surface is always horizontal regardless of heel/trim.
+    # It is at z = eta[2] (heave) in world coordinates.
+    wl_z_world = float(translation[2])   # world z of the waterline plane
+    half = 10.0
+    cx = float(translation[0])
+    cy = float(translation[1])
+    wl_x = np.array([cx - half, cx + half, cx + half, cx - half])
+    wl_y = np.array([cy - half, cy - half, cy + half, cy + half])
+    wl_z = np.full(4, wl_z_world)
     fig.add_trace(go.Mesh3d(
-        x=wl_w[:, 0], y=wl_w[:, 1], z=wl_w[:, 2],
+        x=wl_x, y=wl_y, z=wl_z,
         i=[0, 0], j=[1, 2], k=[2, 3],
         color='cyan', opacity=0.18,
         name='Waterline', showlegend=True,
     ))
 
     # ── 3. Keel ───────────────────────────────────────────────────────────────
+    # Keel geometry is in the simulator body frame (waterline = z=0); no extra shift.
     keel_pts = keel_points()
-    keel_pts[:, 2] += wl_shift
-    # apply cant rotation (positive = windward, i.e. rotx(-angle))
-    from simulink_dvpp.rotations import rotx as _rotx
-    cant_rot = _rotx(-float(keel_angle_deg))
+    cant_rot = rotx(-float(keel_angle_deg))
     keel_pts_body = keel_pts @ cant_rot.T
     keel_w = body_to_world(keel_pts_body)
     fig.add_trace(go.Scatter3d(
@@ -249,11 +249,9 @@ def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0
         mode='lines', line=dict(color='saddlebrown', width=4),
         name='Keel fin',
     ))
-    # Bulb: sphere centred on rotated bulb position
+    # Bulb: sphere centred on the rotated bulb tip
     bulb_arm = 4.1
-    bulb_pos_body = cant_rot @ np.array([0.0, 0.0, -bulb_arm + wl_shift])
-    # offset the keel attachment point (root is at x=-0.037595)
-    bulb_pos_body[0] += -0.037595
+    bulb_pos_body = cant_rot @ np.array([-0.037595, 0.0, -bulb_arm], dtype=float)
     bulb_w = body_to_world(bulb_pos_body[None, :])[0]
     u_s = np.linspace(0, 2 * np.pi, 12)
     v_s = np.linspace(0, np.pi, 8)
@@ -268,12 +266,12 @@ def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0
     ))
 
     # ── 4. Foils ──────────────────────────────────────────────────────────────
+    # Foil geometry is in the simulator body frame (waterline = z=0); no extra shift.
     for pts_raw, label, color in [
         (foil_points_onside(), 'Foil (onside)', '#9333ea'),
         (foil_points_offside(), 'Foil (offside)', '#c084fc'),
     ]:
         pts = pts_raw.copy()
-        pts[:, 2] += wl_shift
         pts_w = body_to_world(pts)
         fig.add_trace(go.Scatter3d(
             x=pts_w[:, 0], y=pts_w[:, 1], z=pts_w[:, 2],

@@ -196,7 +196,6 @@ class SimulinkDVPP6DOF:
                 time=float(t),
                 keel_angle_deg=float(keel_angle_deg),
                 zero=self.zero,
-                wl_z_shift=-self.waterline_z,
             )
         )
         foil_outputs = foil_forces(
@@ -207,7 +206,6 @@ class SimulinkDVPP6DOF:
                 wave=wave,
                 time=float(t),
                 zero=self.zero,
-                wl_z_shift=-self.waterline_z,
             )
         )
         if use_foil:
