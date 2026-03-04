@@ -18,12 +18,15 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import pandas as pd
 import os, sys, time, tempfile
 
 # ── project modules ──────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from panel_solver   import PanelSolver
-from simulink_dvpp import SIMULINK_DISPLACEMENT_KG, run_simulation
+from simulink_dvpp import SIMULINK_DISPLACEMENT_KG, run_simulation, build_solver, SteadyStateResult
+from simulink_dvpp.constants import KNOTS_PER_MPS
+from simulink_dvpp.kinematics import body_to_world_rotation
 from simulink_dvpp.radiation import DEFAULT_OMEGA as _NEMOH_OMEGA, DEFAULT_B33 as _NEMOH_B33
 from orc_dxt import parse_dxt
 from validate_sphere import _retardation_kernel, _simulate_cummins, _analytical_drop
@@ -58,13 +61,115 @@ for key, default in [
     ('orc_rig',      None),
     ('jib_id',       None),
     ('headsail_id',  None),
+    ('ss_done',      False),
+    ('ss_result',    None),
+    ('polar_results', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
+
+def _force_history_to_arrays(force_history):
+    if not force_history:
+        return {}
+
+    component_attrs = {
+        "Gravity": "gravity",
+        "Hydrostatics": "hydrostatics",
+        "Resistance": "resistance",
+        "Radiation": "radiation",
+        "Diffraction": "diffraction",
+        "Sails": "sails",
+        "Appendages": "appendages",
+        "Foils": "foils",
+    }
+    arrays = {
+        label: np.vstack([getattr(force, attr) for force in force_history])
+        for label, attr in component_attrs.items()
+    }
+    arrays["Other Loads"] = np.vstack([force.total_without_radiation_sign() for force in force_history])
+    arrays["Net RHS"] = arrays["Other Loads"] - arrays["Radiation"]
+    return arrays
+
+
+def _body_linear_velocity_to_world(y_vals):
+    velocities_world = np.zeros((len(y_vals), 3), dtype=float)
+    for idx, state in enumerate(np.asarray(y_vals, dtype=float)):
+        velocities_world[idx, :] = body_to_world_rotation(state[:6]) @ state[6:9]
+    return velocities_world
+
+
+def _force_arrays_world(force_arrays, eta_hist):
+    if not force_arrays:
+        return {}
+
+    eta_hist = np.asarray(eta_hist, dtype=float)
+    rotations = [body_to_world_rotation(eta) for eta in eta_hist]
+    arrays_world = {}
+    for component, values in force_arrays.items():
+        values = np.asarray(values, dtype=float)
+        if values.shape[1] < 3:
+            continue
+        world = np.zeros_like(values[:, :3])
+        for idx, rotation in enumerate(rotations):
+            world[idx, :] = rotation @ values[idx, :3]
+        arrays_world[component] = world
+    return arrays_world
+
+
+def _results_dataframe(t_vals, y_vals, force_arrays, force_arrays_world):
+    cols = ["x", "y", "z", "phi", "theta", "psi", "u", "v", "w", "p", "q", "r"]
+    df = pd.DataFrame(y_vals, columns=cols)
+    df.insert(0, "t", t_vals)
+    df["phi_deg"] = np.rad2deg(df["phi"])
+    df["theta_deg"] = np.rad2deg(df["theta"])
+    df["psi_deg"] = np.rad2deg(df["psi"])
+    df["p_deg_s"] = np.rad2deg(df["p"])
+    df["q_deg_s"] = np.rad2deg(df["q"])
+    df["r_deg_s"] = np.rad2deg(df["r"])
+    df["u_kn"] = df["u"] * KNOTS_PER_MPS
+    df["v_kn"] = df["v"] * KNOTS_PER_MPS
+    df["bsp_kn"] = np.hypot(df["u"], df["v"]) * KNOTS_PER_MPS
+    df["z_rel"] = df["z"] - df["z"].iloc[0]
+    vel_world = _body_linear_velocity_to_world(y_vals)
+    df["xdot_world"] = vel_world[:, 0]
+    df["ydot_world"] = vel_world[:, 1]
+    df["zdot_world"] = vel_world[:, 2]
+
+    if force_arrays:
+        component_prefix = {
+            "Other Loads": "other",
+            "Radiation": "rad",
+            "Net RHS": "rhs",
+        }
+        labels = ["x", "y", "z", "mx", "my", "mz"]
+        for component, prefix in component_prefix.items():
+            padded = np.full((len(t_vals), 6), np.nan, dtype=float)
+            padded[1:, :] = force_arrays[component]
+            for idx, label in enumerate(labels):
+                df[f"{prefix}_{label}"] = padded[:, idx]
+
+    if force_arrays_world:
+        world_prefix = {
+            "Hydrostatics": "hydro_world",
+            "Foils": "foil_world",
+            "Appendages": "append_world",
+            "Gravity": "grav_world",
+            "Radiation": "rad_world",
+            "Net RHS": "rhs_world",
+        }
+        labels = ["x", "y", "z"]
+        for component, prefix in world_prefix.items():
+            padded = np.full((len(t_vals), 3), np.nan, dtype=float)
+            padded[1:, :] = force_arrays_world[component]
+            for idx, label in enumerate(labels):
+                df[f"{prefix}_{label}"] = padded[:, idx]
+
+    return df
+
 # ─────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["🔬 Panel Solver", "▶️ Simulation", "📈 Results", "📊 Coefficients", "🏊 Drop Test"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["🔬 Panel Solver", "▶️ Simulation", "📈 Results", "📊 Coefficients", "🏊 Drop Test", "🧭 Steady State"]
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -327,8 +432,8 @@ with tab2:
         st.subheader("Appendages")
         use_foil    = st.checkbox("Deploy leeward foil", value=True)
         foil_cant   = st.slider("Foil rake angle [°]", 0, 10, 4)
-        keel_angle_deg = st.slider("Keel cant angle [°]", -45, 45, 0)
-        st.caption("The translated Simulink path currently keeps the rudder branch at zero, matching the source model wiring.")
+        keel_angle_deg = st.slider("Keel cant angle [°]  (+ = windward)", -45, 45, 0)
+        st.caption("Positive cant = bulb to windward (port on port tack). Rudder sideforce computed automatically from drift angle.")
 
     with col_time:
         st.subheader("Integration")
@@ -449,8 +554,8 @@ with tab2:
             np.deg2rad(float(yaw0_deg)),
         ], dtype=float)
         nu0 = np.array([
-            float(start_bsp_kn) / 1.943844,
-            float(sway0_kn) / 1.943844,
+            float(start_bsp_kn) / KNOTS_PER_MPS,
+            float(sway0_kn) / KNOTS_PER_MPS,
             float(heave0),
             np.deg2rad(float(roll_rate0)),
             np.deg2rad(float(pitch_rate0)),
@@ -507,70 +612,249 @@ with tab3:
     if not st.session_state.sim_done:
         st.info("Run a simulation in the Simulation tab first.")
     else:
-        t_vals = st.session_state.t_vals
-        y_vals = st.session_state.y_vals
+        sim_outputs = st.session_state.sim_outputs
+        t_vals = sim_outputs.t_vals
+        y_vals = sim_outputs.y_vals
+        force_arrays = _force_history_to_arrays(sim_outputs.force_history)
+        force_arrays_world = _force_arrays_world(force_arrays, y_vals[1:1 + len(sim_outputs.force_history), :6])
+        t_force = t_vals[1:1 + len(sim_outputs.force_history)]
 
-        # --- Velocity ---
-        st.subheader("Velocities (body frame)")
-        fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+        x_pos = y_vals[:, 0]
+        y_pos = y_vals[:, 1]
+        z_pos = y_vals[:, 2]
+        z_rel = z_pos - z_pos[0]
+        vel_world = _body_linear_velocity_to_world(y_vals)
+        zdot_world = vel_world[:, 2]
 
-        ax = axes[0]
-        ax.plot(t_vals, y_vals[:, 6] * 1.943844, label='u — surge [kn]')
-        ax.plot(t_vals, y_vals[:, 7] * 1.943844, label='v — sway [kn]')
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('Speed [kn]')
-        ax.set_title('Surge & sway speed'); ax.legend(); ax.grid()
+        u_kn = y_vals[:, 6] * KNOTS_PER_MPS
+        v_kn = y_vals[:, 7] * KNOTS_PER_MPS
+        bsp_kn = np.hypot(y_vals[:, 6], y_vals[:, 7]) * KNOTS_PER_MPS
+        w_mps = y_vals[:, 8]
 
-        ax = axes[1]
-        ax.plot(t_vals, y_vals[:, 8], label='w — heave [m/s]', color='purple')
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('w [m/s]')
-        ax.set_title('Heave velocity'); ax.legend(); ax.grid()
+        heel_deg = np.rad2deg(y_vals[:, 3])
+        trim_deg = np.rad2deg(y_vals[:, 4])
+        yaw_deg = np.rad2deg(y_vals[:, 5])
+        p_deg_s = np.rad2deg(y_vals[:, 9])
+        q_deg_s = np.rad2deg(y_vals[:, 10])
+        r_deg_s = np.rad2deg(y_vals[:, 11])
 
-        st.pyplot(fig); plt.close(fig)
+        track_length = float(np.sum(np.hypot(np.diff(x_pos), np.diff(y_pos))))
+        heel_peak = float(np.max(np.abs(heel_deg)))
+        heave_excursion = float(np.ptp(z_rel))
+        sinkage_min = float(np.min(z_rel))
 
-        # --- Position ---
-        st.subheader("World-frame position")
-        fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Final BSP", f"{bsp_kn[-1]:.2f} kn")
+        mc2.metric("Peak Heel", f"{heel_peak:.1f}°")
+        mc3.metric("Heave Excursion", f"{heave_excursion:.3f} m")
+        mc4.metric("Track Length", f"{track_length:.1f} m")
+        st.caption(
+            f"Waterline z used: {sim_outputs.waterline_z:.3f} m. "
+            f"Minimum relative sinkage: {sinkage_min:.3f} m. "
+            "Yaw is intentionally suppressed in the active 5-DOF runtime."
+        )
 
-        ax = axes[0]
-        ax.plot(t_vals, y_vals[:, 0], label='x [m]')
-        ax.plot(t_vals, y_vals[:, 1], label='y [m]')
-        ax.set_xlabel('Time [s]'); ax.legend(); ax.grid()
-        ax.set_title('Surge & sway position')
+        st.subheader("State Overview")
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-        ax = axes[1]
-        ax.plot(t_vals, y_vals[:, 2], label='z [m]', color='teal')
-        ax.axhline(0, color='k', linestyle='--', linewidth=0.8, label='waterline')
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('z [m]')
-        ax.set_title('Heave position (positive up)'); ax.legend(); ax.grid()
+        ax = axes[0, 0]
+        ax.plot(x_pos, y_pos, color="tab:blue", lw=2.0)
+        ax.scatter([x_pos[0]], [y_pos[0]], color="green", s=50, label="Start", zorder=3)
+        ax.scatter([x_pos[-1]], [y_pos[-1]], color="red", s=50, label="End", zorder=3)
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_title("Plan View Trajectory")
+        ax.axis("equal")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
 
-        st.pyplot(fig); plt.close(fig)
+        ax = axes[0, 1]
+        ax.plot(t_vals, bsp_kn, label="BSP [kn]", color="tab:blue", lw=2.0)
+        ax.plot(t_vals, u_kn, label="u [kn]", color="tab:orange", alpha=0.85)
+        ax.plot(t_vals, v_kn, label="v [kn]", color="tab:green", alpha=0.85)
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Speed [kn]")
+        ax.set_title("Body-Frame Speeds")
+        ax.grid(True, alpha=0.3)
+        ax.legend(ncols=3, fontsize=9)
 
-        # --- Angles ---
-        st.subheader("Orientation (Euler angles)")
-        fig, ax = plt.subplots(figsize=(11, 3.5))
-        ax.plot(t_vals, np.rad2deg(y_vals[:, 3]), label='φ — heel [°]')
-        ax.plot(t_vals, np.rad2deg(y_vals[:, 4]), label='θ — trim [°]')
-        ax.plot(t_vals, np.rad2deg(y_vals[:, 5]), label='ψ — yaw [°]')
-        ax.set_xlabel('Time [s]'); ax.set_ylabel('Angle [°]')
-        ax.set_title('Euler angles'); ax.legend(); ax.grid()
-        st.pyplot(fig); plt.close(fig)
+        ax = axes[1, 0]
+        ax.plot(t_vals, z_rel, label="z - z0 [m]", color="teal", lw=2.0)
+        ax.axhline(0.0, color="k", linestyle="--", linewidth=0.8)
+        ax2 = ax.twinx()
+        ax2.plot(t_vals, zdot_world, label="zdot world [m/s]", color="purple", alpha=0.8)
+        ax2.plot(t_vals, w_mps, label="w body [m/s]", color="tab:orange", alpha=0.45, linestyle="--")
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Heave Excursion [m]", color="teal")
+        ax2.set_ylabel("Vertical Speed [m/s]", color="purple")
+        ax.set_title("Earth-Frame Vertical Motion")
+        ax.grid(True, alpha=0.3)
+        lines = ax.get_lines() + ax2.get_lines()
+        ax.legend(lines, [line.get_label() for line in lines], loc="best", fontsize=9)
 
-        # --- Summary metrics ---
-        st.subheader("Performance metrics")
-        final_u = y_vals[-1, 6] * 1.943844
-        max_heel = np.max(np.abs(np.rad2deg(y_vals[:, 3])))
-        max_z    = np.max(np.abs(y_vals[:, 2]))
+        ax = axes[1, 1]
+        ax.plot(t_vals, heel_deg, label="Heel φ [deg]", color="tab:red", lw=2.0)
+        ax.plot(t_vals, trim_deg, label="Trim θ [deg]", color="tab:brown", lw=2.0)
+        if np.max(np.abs(yaw_deg)) > 1e-6:
+            ax.plot(t_vals, yaw_deg, label="Yaw ψ [deg]", color="tab:gray", lw=1.5)
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Angle [deg]")
+        ax.set_title("Attitude")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
 
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Final boat speed", f"{final_u:.2f} kn")
-        mc2.metric("Max heel angle",   f"{max_heel:.1f}°")
-        mc3.metric("Max heave amp.",   f"{max_z:.3f} m")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
 
-        # --- Download CSV ---
-        import io, pandas as pd
-        cols = ['x','y','z','phi','theta','psi','u','v','w','p','q','r']
-        df = pd.DataFrame(y_vals, columns=cols)
-        df.insert(0, 't', t_vals)
+        st.subheader("Angular Rates")
+        fig, ax = plt.subplots(figsize=(12, 3.5))
+        ax.plot(t_vals, p_deg_s, label="p [deg/s]", color="tab:red")
+        ax.plot(t_vals, q_deg_s, label="q [deg/s]", color="tab:brown")
+        if np.max(np.abs(r_deg_s)) > 1e-6:
+            ax.plot(t_vals, r_deg_s, label="r [deg/s]", color="tab:gray")
+        ax.axhline(0.0, color="k", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Rate [deg/s]")
+        ax.set_title("Body Angular Rates")
+        ax.grid(True, alpha=0.3)
+        ax.legend(ncols=3, fontsize=9)
+        st.pyplot(fig)
+        plt.close(fig)
+
+        if force_arrays_world:
+            st.subheader("Earth-Frame Vertical Force Balance")
+            world_vertical_components = {
+                "Gravity": force_arrays_world["Gravity"][:, 2],
+                "Hydrostatics + FK": force_arrays_world["Hydrostatics"][:, 2],
+                "Foils": force_arrays_world["Foils"][:, 2],
+                "Appendages": force_arrays_world["Appendages"][:, 2],
+                "Sails": force_arrays_world["Sails"][:, 2],
+                "Diffraction": force_arrays_world["Diffraction"][:, 2],
+                "Radiation": force_arrays_world["Radiation"][:, 2],
+                "Net vertical RHS": force_arrays_world["Net RHS"][:, 2],
+            }
+            fig, ax = plt.subplots(figsize=(12, 4.5))
+            colors = {
+                "Gravity": "#6b7280",
+                "Hydrostatics + FK": "#0f766e",
+                "Foils": "#9333ea",
+                "Appendages": "#059669",
+                "Sails": "#dc2626",
+                "Diffraction": "#2563eb",
+                "Radiation": "#7c3aed",
+                "Net vertical RHS": "#000000",
+            }
+            for label in ["Gravity", "Hydrostatics + FK", "Foils", "Appendages", "Sails", "Diffraction"]:
+                values = world_vertical_components[label] / 1e3
+                if np.max(np.abs(values)) < 1e-6:
+                    continue
+                ax.plot(t_force, values, label=label, color=colors[label], linewidth=1.9)
+            ax.plot(
+                t_force,
+                world_vertical_components["Radiation"] / 1e3,
+                label="Radiation",
+                color=colors["Radiation"],
+                linewidth=1.8,
+                linestyle="--",
+            )
+            ax.plot(
+                t_force,
+                world_vertical_components["Net vertical RHS"] / 1e3,
+                label="Net vertical RHS",
+                color=colors["Net vertical RHS"],
+                linewidth=2.4,
+            )
+            ax.axhline(0.0, color="k", linewidth=0.8, linestyle="--")
+            ax.set_xlabel("Time [s]")
+            ax.set_ylabel("World vertical load [kN]")
+            ax.set_title("Earth-Frame Vertical Load Balance")
+            ax.grid(True, alpha=0.3)
+            ax.legend(ncols=3, fontsize=9)
+            st.pyplot(fig)
+            plt.close(fig)
+            st.caption(
+                "This plot is in the earth frame. Use it to judge lift, sinkage, and foil unloading. "
+                "Body-frame `Fz` is not the same as vertical support once the yacht heels or trims."
+            )
+
+        if force_arrays:
+            st.subheader("Force Breakdown")
+            dof_labels = {
+                "Surge force Fx": 0,
+                "Sway force Fy": 1,
+                "Heave force Fz": 2,
+                "Roll moment Mx": 3,
+                "Pitch moment My": 4,
+                "Yaw moment Mz": 5,
+            }
+            selected_dof = st.selectbox(
+                "Generalized load to inspect",
+                list(dof_labels.keys()),
+                index=2,
+            )
+            load_idx = dof_labels[selected_dof]
+            load_scale = 1e-3
+            load_unit = "kN" if load_idx < 3 else "kN·m"
+            frame_mode = st.radio(
+                "Force frame",
+                ["Body frame", "Earth frame"],
+                horizontal=True,
+                help="Body frame is used by the EOM. Earth frame is better for interpreting vertical support.",
+            )
+            plotting_arrays = force_arrays
+            plotting_time = t_force
+            if frame_mode == "Earth frame":
+                if load_idx >= 3:
+                    st.info("Earth-frame transformation is currently provided for forces only; moments remain shown in body frame.")
+                    plotting_arrays = force_arrays
+                else:
+                    plotting_arrays = {label: values[:, :3] for label, values in force_arrays_world.items()}
+            component_colors = {
+                "Gravity": "#6b7280",
+                "Hydrostatics": "#0f766e",
+                "Resistance": "#f59e0b",
+                "Radiation": "#7c3aed",
+                "Diffraction": "#2563eb",
+                "Sails": "#dc2626",
+                "Appendages": "#059669",
+                "Foils": "#9333ea",
+                "Other Loads": "#111827",
+                "Net RHS": "#000000",
+            }
+
+            fig, ax = plt.subplots(figsize=(12, 4.5))
+            for component in ["Gravity", "Hydrostatics", "Resistance", "Diffraction", "Sails", "Appendages", "Foils"]:
+                values = plotting_arrays[component][:, load_idx] * load_scale
+                if np.max(np.abs(values)) < 1e-6:
+                    continue
+                ax.plot(plotting_time, values, label=component, color=component_colors[component], alpha=0.9)
+
+            ax.plot(
+                plotting_time,
+                plotting_arrays["Radiation"][:, load_idx] * load_scale,
+                label="Radiation",
+                color=component_colors["Radiation"],
+                linestyle="--",
+                linewidth=1.8,
+            )
+            ax.plot(
+                plotting_time,
+                plotting_arrays["Net RHS"][:, load_idx] * load_scale,
+                label="Net RHS",
+                color=component_colors["Net RHS"],
+                linewidth=2.4,
+            )
+            ax.axhline(0.0, color="k", linewidth=0.8, linestyle="--")
+            ax.set_xlabel("Time [s]")
+            ax.set_ylabel(load_unit)
+            ax.set_title(f"{selected_dof} Breakdown ({frame_mode})")
+            ax.grid(True, alpha=0.3)
+            ax.legend(ncols=3, fontsize=9)
+            st.pyplot(fig)
+            plt.close(fig)
+
+        df = _results_dataframe(t_vals, y_vals, force_arrays, force_arrays_world)
         csv = df.to_csv(index=False)
         st.download_button(
             "⬇️ Download results (CSV)",
@@ -620,7 +904,6 @@ with tab4:
         st.pyplot(fig); plt.close(fig)
 
         st.subheader("Hydrostatic restoring matrix C")
-        import pandas as pd
         C_df = pd.DataFrame(
             solver.C,
             index=dof_labels, columns=dof_labels
@@ -867,3 +1150,279 @@ with tab5:
                 plt.close(fig)
             else:
                 st.info("Configure the drop parameters and click **Run Drop Test**.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — STEADY STATE / VPP
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.header("Steady-State VPP Solver")
+    st.markdown(
+        "Finds the **equilibrium boat speed, heel, and trim** for a given TWA/TWS "
+        "by solving the quasi-static force balance (nu_dot = 0, calm water). "
+        "A flat-power scan maximises **|VMG|** by varying sail flat over the selected bounds."
+    )
+
+    ss_hull = os.path.join(os.path.dirname(__file__), "PRB F.stl")
+
+    col_ss_in, col_ss_out = st.columns([1, 2])
+
+    with col_ss_in:
+        st.subheader("Conditions")
+        ss_twa = st.slider("True Wind Angle [°]", 30, 180, 70, key="ss_twa")
+        ss_tws = st.slider("True Wind Speed [kn]", 1, 40, 15, key="ss_tws")
+
+        # ── Sail selection ────────────────────────────────────────────────────
+        st.markdown("**Sail selection**")
+        _ss_rig = st.session_state.get('orc_rig', None)
+        if _ss_rig is not None:
+            _jibs    = _ss_rig.jibs()
+            _flyings = _ss_rig.flying_headsails()
+            # Build sail_configs list from user-selected sails
+            _jib_options  = {h.label(): h for h in _jibs}
+            _fly_options  = {h.label(): h for h in _flyings}
+            _sel_jibs = st.multiselect(
+                "Non-flying jibs to try",
+                list(_jib_options.keys()),
+                default=list(_jib_options.keys())[:1] if _jib_options else [],
+                key="ss_sel_jibs",
+            )
+            _sel_fly = st.multiselect(
+                "Flying headsails to try",
+                list(_fly_options.keys()),
+                default=list(_fly_options.keys())[:1] if _fly_options else [],
+                key="ss_sel_fly",
+            )
+            # Build configs: each selected jib (c0=0) + each selected flying (c0=1)
+            ss_sail_configs = []
+            for lbl in _sel_jibs:
+                g = _jib_options[lbl]
+                ss_sail_configs.append((g, None, False, lbl))
+            for lbl in _sel_fly:
+                g = _fly_options[lbl]
+                ss_sail_configs.append((None, g, True, lbl))
+            if not ss_sail_configs:
+                ss_sail_configs = None   # fallback: use simulator default
+            # Also pass mainsail from rig
+            _ss_mainsail = _ss_rig.mainsail
+        else:
+            ss_c0 = st.checkbox("Flying headsail (C0)", value=False, key="ss_c0")
+            ss_sail_configs = None   # single config via c0_enabled
+            _ss_mainsail = (st.session_state.get('orc_rig') and
+                            st.session_state.orc_rig.mainsail)
+
+        # ── Appendages ────────────────────────────────────────────────────────
+        st.markdown("**Appendages**")
+        ss_foil     = st.checkbox("Deploy leeward foil", value=True, key="ss_foil")
+
+        st.caption("Cant: positive = windward (bulb to port on port tack)")
+        _cant_col1, _cant_col2 = st.columns(2)
+        ss_cant_min = _cant_col1.number_input("Cant min [°]  (+ = windward)", -45, 45, 0, step=5, key="ss_cant_min")
+        ss_cant_max = _cant_col2.number_input("Cant max [°]  (+ = windward)", -45, 45, 40, step=5, key="ss_cant_max")
+        if ss_cant_min == ss_cant_max:
+            ss_cant_scan = [float(ss_cant_min)]
+        else:
+            _n_cant = st.select_slider("Cant steps", options=[2, 3, 5], value=3, key="ss_cant_n")
+            ss_cant_scan = list(np.linspace(float(ss_cant_min), float(ss_cant_max), int(_n_cant)))
+
+        st.markdown("**Optimiser trim bounds**")
+        ss_reef_min = st.slider("Reef min", 0.3, 1.0, 0.5, step=0.05, key="ss_reef_min")
+        ss_flat_min = st.slider("Flat min", 0.3, 1.0, 0.5, step=0.05, key="ss_flat_min")
+        ss_rake_max = st.slider("Max foil rake [°]", 1, 10, 10, key="ss_rake_max")
+
+        st.markdown("**Model settings**")
+        ss_mass = st.number_input(
+            "Displacement [kg]",
+            value=float(st.session_state.mass_kg),
+            step=100.0,
+            key="ss_mass",
+        )
+        _ss_res_options = {
+            "MaxSURF lookup (recommended)": 2,
+            "DSYHS + Savitsky blend": 4,
+            "DSYHS only": 3,
+            "Savitsky planing": 1,
+        }
+        ss_res_label = st.selectbox(
+            "Resistance model",
+            list(_ss_res_options.keys()),
+            index=0,
+            key="ss_res",
+        )
+        ss_res_mode = _ss_res_options[ss_res_label]
+
+        ss_rad_inputs = st.session_state.get('rad_inputs', None)
+
+        st.markdown("---")
+        btn_single = st.button("🔍 Find Equilibrium", use_container_width=True)
+        btn_polar  = st.button("📡 Build Polar (40–180°, step 10°)", use_container_width=True)
+
+    with col_ss_out:
+
+        # ── Single-point solve ────────────────────────────────────────────
+        if btn_single:
+            _c0_fallback = ss_c0 if _ss_rig is None else False
+            with st.spinner("Solving quasi-static equilibrium…"):
+                try:
+                    solver = build_solver(
+                        hull_file=ss_hull,
+                        mass=ss_mass,
+                        rad_inputs=ss_rad_inputs,
+                        resistance_mode=ss_res_mode,
+                        mainsail_geom=_ss_mainsail,
+                    )
+                    result = solver.optimize_vmg(
+                        twa_deg=ss_twa,
+                        tws_kn=ss_tws,
+                        c0_enabled=_c0_fallback,
+                        use_foil=ss_foil,
+                        keel_angle_deg=float(ss_cant_min),  # start point; scan handles range
+                        reef_bounds=(ss_reef_min, 1.0),
+                        flat_bounds=(ss_flat_min, 1.0),
+                        rake_bounds=(0.0, float(ss_rake_max)),
+                        cant_scan=ss_cant_scan,
+                        sail_configs=ss_sail_configs,
+                    )
+                    st.session_state.ss_result = result
+                    st.session_state.ss_done = True
+                except Exception as exc:
+                    st.error(f"Solver error: {exc}")
+
+        # ── Polar build ───────────────────────────────────────────────────
+        if btn_polar:
+            _c0_fallback = ss_c0 if _ss_rig is None else False
+            twa_list = list(range(40, 181, 10))
+            polar_rows = []
+            progress_bar = st.progress(0.0)
+            status_txt   = st.empty()
+
+            try:
+                solver = build_solver(
+                    hull_file=ss_hull,
+                    mass=ss_mass,
+                    rad_inputs=ss_rad_inputs,
+                    resistance_mode=ss_res_mode,
+                    mainsail_geom=_ss_mainsail,
+                )
+                for i, twa_i in enumerate(twa_list):
+                    status_txt.text(f"Solving TWA = {twa_i}°…")
+                    try:
+                        # For the polar, filter flying-headsail configs to
+                        # downwind angles (TWA ≥ 110°) to avoid the optimizer
+                        # finding a spurious high-speed "overrun" equilibrium
+                        # at upwind angles where AWA turns broad.
+                        if ss_sail_configs is not None:
+                            _polar_cfgs = [
+                                cfg for cfg in ss_sail_configs
+                                if (not cfg[2]) or twa_i >= 110   # c0=False, or downwind
+                            ] or ss_sail_configs  # fallback to all if filter empties list
+                        else:
+                            _polar_cfgs = None
+                        r = solver.optimize_vmg(
+                            twa_deg=twa_i,
+                            tws_kn=ss_tws,
+                            c0_enabled=_c0_fallback,
+                            use_foil=ss_foil,
+                            keel_angle_deg=float(ss_cant_min),
+                            reef_bounds=(ss_reef_min, 1.0),
+                            flat_bounds=(ss_flat_min, 1.0),
+                            rake_bounds=(0.0, float(ss_rake_max)),
+                            cant_scan=ss_cant_scan,
+                            sail_configs=_polar_cfgs,
+                        )
+                    except Exception:
+                        r = None
+                    polar_rows.append((twa_i, r))
+                    progress_bar.progress((i + 1) / len(twa_list))
+
+                st.session_state.polar_results = polar_rows
+                status_txt.text("Polar complete.")
+            except Exception as exc:
+                st.error(f"Polar solver error: {exc}")
+
+        # ── Display single-point result ───────────────────────────────────
+        if st.session_state.ss_done and st.session_state.ss_result is not None:
+            r: SteadyStateResult = st.session_state.ss_result
+
+            conv_icon = "✅" if r.converged else "⚠️"
+            st.subheader(f"Equilibrium — TWA {ss_twa}°  TWS {ss_tws} kn  {conv_icon}")
+            if not r.converged:
+                st.warning("Solver did not fully converge — results are approximate.")
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("BSP", f"{r.bsp_kn:.2f} kn")
+            m2.metric("VMG", f"{r.vmg_kn:.2f} kn")
+            m3.metric("Heel", f"{r.heel_deg:.1f}°")
+            m4.metric("Trim", f"{r.trim_deg:.2f}°")
+            m5.metric("Heave", f"{r.heave_m:.3f} m")
+
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("Reef", f"{r.reef:.2f}")
+            t2.metric("Flat", f"{r.flat:.2f}")
+            t3.metric("Foil rake", f"{r.rake_deg:.1f}°")
+            t4.metric("Keel cant", f"{r.cant_deg:.1f}°")
+            st.caption(f"Drift: {r.drift_deg:.2f}°  ·  Sail: {r.sail_id}")
+
+            # Force residual bar chart
+            st.markdown("**Force residual at equilibrium** (should be near zero)")
+            labels = ["Fx (N)", "Fy (N)", "Fz (N)", "Mx (Nm)", "My (Nm)"]
+            fig_res, ax_res = plt.subplots(figsize=(6, 2.2))
+            colors = ['green' if abs(v) < 500 else 'orange' if abs(v) < 5000 else 'red'
+                      for v in r.force_balance]
+            ax_res.barh(labels, r.force_balance, color=colors)
+            ax_res.axvline(0, color='k', lw=0.8)
+            ax_res.set_xlabel("Residual force / moment")
+            ax_res.grid(True, axis='x', alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_res)
+            plt.close(fig_res)
+
+        # ── Display polar ─────────────────────────────────────────────────
+        if st.session_state.polar_results:
+            rows = st.session_state.polar_results
+            twa_arr  = np.array([r[0] for r in rows], dtype=float)
+            bsp_arr  = np.array([r[1].bsp_kn if r[1] else np.nan for r in rows])
+            vmg_arr  = np.array([r[1].vmg_kn if r[1] else np.nan for r in rows])
+            heel_arr = np.array([r[1].heel_deg if r[1] else np.nan for r in rows])
+
+            st.subheader(f"Speed Polar — TWS {ss_tws} kn")
+            fig_pol, ax_pol = plt.subplots(subplot_kw={'projection': 'polar'},
+                                           figsize=(5, 5))
+            twa_rad_arr = np.deg2rad(twa_arr)
+            # Mirror to port side
+            twa_port = -twa_rad_arr
+            ax_pol.plot(twa_rad_arr, bsp_arr, 'b-o', ms=4, label='BSP starboard')
+            ax_pol.plot(twa_port,    bsp_arr, 'b--o', ms=4, label='BSP port')
+            ax_pol.set_theta_zero_location('N')
+            ax_pol.set_theta_direction(-1)
+            ax_pol.set_title(f"BSP [kn]  ·  TWS {ss_tws} kn", pad=14)
+            ax_pol.legend(loc='lower right', fontsize=8)
+            st.pyplot(fig_pol)
+            plt.close(fig_pol)
+
+            # Data table
+            df_polar = pd.DataFrame({
+                "TWA [°]": twa_arr.astype(int),
+                "BSP [kn]": np.round(bsp_arr, 2),
+                "VMG [kn]": np.round(vmg_arr, 2),
+                "Heel [°]": np.round(heel_arr, 1),
+                "Trim [°]": [round(r[1].trim_deg, 2) if r[1] else None for r in rows],
+                "Reef":     [round(r[1].reef, 2) if r[1] else None for r in rows],
+                "Flat":     [round(r[1].flat, 2) if r[1] else None for r in rows],
+                "Rake [°]": [round(r[1].rake_deg, 1) if r[1] else None for r in rows],
+                "Cant [°]": [round(r[1].cant_deg, 1) if r[1] else None for r in rows],
+                "Sail":     [r[1].sail_id if r[1] else None for r in rows],
+                "Converged": [r[1].converged if r[1] else False for r in rows],
+            })
+            st.dataframe(df_polar, use_container_width=True)
+
+            csv_polar = df_polar.to_csv(index=False).encode()
+            st.download_button(
+                "⬇️ Download polar CSV",
+                csv_polar,
+                file_name=f"polar_TWS{ss_tws}kn.csv",
+                mime="text/csv",
+            )
+
+        if not st.session_state.ss_done and not st.session_state.polar_results:
+            st.info("Set conditions on the left and click **Find Equilibrium** or **Build Polar**.")
