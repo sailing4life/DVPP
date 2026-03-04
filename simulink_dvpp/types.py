@@ -72,6 +72,7 @@ class AppendageInputs:
     keel_angle_deg: float
     zero: float
     rudder_force: np.ndarray = field(default_factory=lambda: np.zeros(6, dtype=float))
+    wl_z_shift: float = 0.0
 
 
 @dataclass
@@ -82,6 +83,8 @@ class AppendageOutputs:
     keel_gravity_force: np.ndarray
     keel_hydrodynamic_force: np.ndarray
     keel_points: np.ndarray
+    keel_points_body: np.ndarray
+    keel_points_world: np.ndarray
     relative_speed: float
     relative_angle_deg: float
     relative_velocity_local: np.ndarray
@@ -97,6 +100,7 @@ class FoilInputs:
     time: float
     zero: float
     chord_length: float = 0.6
+    wl_z_shift: float = 0.0
 
 
 @dataclass
@@ -111,6 +115,10 @@ class FoilOutputs:
     offside_force: np.ndarray
     onside_points: np.ndarray
     offside_points: np.ndarray
+    onside_points_body: np.ndarray
+    offside_points_body: np.ndarray
+    onside_points_world: np.ndarray
+    offside_points_world: np.ndarray
 
 
 @dataclass

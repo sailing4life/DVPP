@@ -8,11 +8,10 @@ import numpy as np
 from .constants import GRAVITY, SEA_WATER_DENSITY
 from .helpers import (
     as_wave_array,
-    bounded_section_coefficients,
     segment_intersection_at_plane,
-    wave_velocity_components,
+    wave_velocity_world,
 )
-from .rotations import rotx, roty
+from .kinematics import body_to_world_rotation
 from .types import FoilInputs, FoilOutputs
 
 
@@ -41,7 +40,7 @@ _FOIL_POINTS_ONSIDE = np.array([
     [1.609166, -6.825013, 1.520682],
     [1.609166, -6.911797, 1.812046],
 ], dtype=float)
-_FOIL_POINTS_ONSIDE[:, 2] = _FOIL_POINTS_ONSIDE[:, 2] + 0.406
+# z-values are in raw STL coordinates; wl_z_shift = -waterline_z is applied at call time in foil_forces()
 
 
 @dataclass
@@ -64,27 +63,40 @@ def foil_points_offside():
     return points
 
 
-def foil_gravity_force(points, eta, chord_length, rho_foil=1750.0):
-    points = np.asarray(points, dtype=float)
-    eta = np.asarray(eta, dtype=float)
+def _foil_points_body(points, chord_length):
+    points_body = np.asarray(points, dtype=float).copy()
+    points_body[:, 0] += float(chord_length) / 2.0
+    return points_body
+
+
+def _intersection_weight(point_a, point_b, plane_z):
+    dz = float(point_b[2] - point_a[2])
+    if np.isclose(dz, 0.0):
+        return 0.0
+    return (float(plane_z) - float(point_a[2])) / dz
+
+
+def _foil_gravity_force_body(points_body, gravity_dir_body, chord_length, rho_foil=1750.0):
+    points_body = np.asarray(points_body, dtype=float)
+    gravity_dir_body = np.asarray(gravity_dir_body, dtype=float)
     foil_height = 0.05
-    rotation_x = rotx(-np.rad2deg(eta[3]))
-    rotation_y = roty(-np.rad2deg(eta[4]))
 
-    total_force = np.zeros((points.shape[0], 3), dtype=float)
-    total_moment = np.zeros((points.shape[0], 3), dtype=float)
-    for index in range(points.shape[0] - 1):
-        point_a = points[index, :] @ rotation_x @ rotation_y + np.array([0.0, 0.0, eta[2]])
-        point_b = points[index + 1, :] @ rotation_x @ rotation_y + np.array([0.0, 0.0, eta[2]])
-        length_vector = np.linalg.norm(point_a - point_b)
-        weight = length_vector * chord_length * rho_foil * foil_height
-        force_z = -weight * GRAVITY
-        total_force[index, :] = np.array([0.0, 0.0, force_z], dtype=float)
-        total_moment[index, :] = np.cross(point_a, np.array([0.0, 0.0, force_z]))
+    points_a_body = points_body[:-1]
+    strip_lengths = np.linalg.norm(np.diff(points_body, axis=0), axis=1)
+    strip_masses = strip_lengths * chord_length * rho_foil * foil_height
+    strip_forces = strip_masses[:, None] * GRAVITY * gravity_dir_body[None, :]
+    strip_moments = np.cross(points_a_body, strip_forces)
 
-    force_sum = total_force.sum(axis=0)
-    moment_sum = total_moment.sum(axis=0)
+    force_sum = strip_forces.sum(axis=0)
+    moment_sum = strip_moments.sum(axis=0)
     return np.array([force_sum[0], force_sum[1], force_sum[2], moment_sum[0], moment_sum[1], 0.0], dtype=float)
+
+
+def foil_gravity_force(points, eta, chord_length, rho_foil=1750.0):
+    eta = np.asarray(eta, dtype=float)
+    points_body = _foil_points_body(points, chord_length)
+    gravity_dir_body = body_to_world_rotation(eta).T @ np.array([0.0, 0.0, -1.0], dtype=float)
+    return _foil_gravity_force_body(points_body, gravity_dir_body, chord_length, rho_foil=rho_foil)
 
 
 def _foil_lift_slope_correction(aspect_ratio):
@@ -97,84 +109,119 @@ def _foil_lift_slope_correction(aspect_ratio):
     return corrected_slope / slope_cl
 
 
-def hydrofoil_force(eta_dot, eta, points, rake_foil_deg, chord_length, wave, time, zero, reverse_segment, free_surface_factor):
+def hydrofoil_force(
+    eta_dot,
+    eta,
+    points,
+    rake_foil_deg,
+    chord_length,
+    wave,
+    time,
+    zero,
+    reverse_segment,
+    free_surface_factor,
+    wave_array=None,
+    rotation_bw=None,
+    points_body=None,
+    points_world=None,
+):
     eta_dot = np.asarray(eta_dot, dtype=float)
     eta = np.asarray(eta, dtype=float)
-    points = np.asarray(points, dtype=float).copy()
-    wave_array = as_wave_array(wave)
+    wave_array = as_wave_array(wave) if wave_array is None else np.asarray(wave_array, dtype=float)
 
     rho_water = SEA_WATER_DENSITY
-    rotation_x = rotx(-np.rad2deg(eta[3]))
-    rotation_y = roty(-np.rad2deg(eta[4]))
-
-    points = points @ rotation_y @ rotation_x
-    points = np.column_stack([points[:, 0] + chord_length / 2.0, points[:, 1], points[:, 2] + eta[2]])
-    submerged = points[:, 2] < zero
+    rotation_bw = body_to_world_rotation(eta) if rotation_bw is None else np.asarray(rotation_bw, dtype=float)
+    points_body = _foil_points_body(points, chord_length) if points_body is None else np.asarray(points_body, dtype=float).copy()
+    points_world = (
+        points_body @ rotation_bw.T + eta[:3]
+        if points_world is None
+        else np.asarray(points_world, dtype=float).copy()
+    )
+    submerged = points_world[:, 2] < zero
     true_indices = np.flatnonzero(submerged)
 
-    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    aspect_ratio = np.sum(segment_lengths * submerged[:-1]) / chord_length if chord_length > 0.0 else 0.0
-
-    if true_indices.size > 0 and points[0, 2] > zero and true_indices[0] > 0:
+    if true_indices.size > 0 and points_world[0, 2] > zero and true_indices[0] > 0:
         first = int(true_indices[0])
-        points[first - 1, :] = segment_intersection_at_plane(points[first - 1, :], points[first, :], zero)
+        weight = _intersection_weight(points_world[first - 1, :], points_world[first, :], zero)
+        points_body[first - 1, :] = points_body[first - 1, :] + weight * (points_body[first, :] - points_body[first - 1, :])
+        points_world[first - 1, :] = segment_intersection_at_plane(points_world[first - 1, :], points_world[first, :], zero)
         submerged[first - 1] = True
-    if true_indices.size > 0 and points[-1, 2] > zero and true_indices[-1] < points.shape[0] - 1:
+    if true_indices.size > 0 and points_world[-1, 2] > zero and true_indices[-1] < points_world.shape[0] - 1:
         last = int(true_indices[-1])
-        points[last + 1, :] = segment_intersection_at_plane(points[last, :], points[last + 1, :], zero)
+        weight = _intersection_weight(points_world[last, :], points_world[last + 1, :], zero)
+        points_body[last + 1, :] = points_body[last, :] + weight * (points_body[last + 1, :] - points_body[last, :])
+        points_world[last + 1, :] = segment_intersection_at_plane(points_world[last, :], points_world[last + 1, :], zero)
         submerged[last + 1] = False
 
-    total_force = np.zeros((points.shape[0], 3), dtype=float)
-    total_moment = np.zeros((points.shape[0], 3), dtype=float)
+    segment_vectors = np.diff(points_body, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    aspect_ratio = np.sum(segment_lengths * submerged[:-1]) / chord_length if chord_length > 0.0 else 0.0
+
+    total_force = np.zeros((points_body.shape[0] - 1, 3), dtype=float)
+    total_moment = np.zeros((points_body.shape[0] - 1, 3), dtype=float)
     relative_angle = 0.0
     local_velocity = np.zeros(3, dtype=float)
     relative_velocity = np.zeros(3, dtype=float)
     last_cd = 0.0
     sub_length = 0.0
     correction_3d = _foil_lift_slope_correction(aspect_ratio) if aspect_ratio > 0.0 else 1.0
+    points_a_body = points_body[:-1]
+    points_a_world = points_world[:-1]
+    wave_velocity = wave_velocity_world(wave_array, points_a_world, time, shared_direction=True) @ rotation_bw
+    angular_velocity = eta_dot[3:6]
+    translational_velocity = eta_dot[:3]
+    relative_velocities = translational_velocity[None, :] + np.cross(angular_velocity[None, :], points_a_body) - wave_velocity
+    oriented_segments = -segment_vectors if reverse_segment else segment_vectors
+    valid_segments = segment_lengths > 1e-12
+    if np.any(valid_segments):
+        y_axes = np.zeros_like(oriented_segments)
+        y_axes[valid_segments] = -oriented_segments[valid_segments] / segment_lengths[valid_segments, None]
+        z_axes = np.cross(np.array([1.0, 0.0, 0.0], dtype=float), y_axes)
+        z_norms = np.linalg.norm(z_axes, axis=1)
+        valid_segments &= z_norms > 1e-12
+        z_axes[valid_segments] = z_axes[valid_segments] / z_norms[valid_segments, None]
 
-    for index in range(points.shape[0] - 1):
-        point_a = points[index, :]
-        point_b = points[index + 1, :]
-        segment = point_a - point_b if reverse_segment else point_b - point_a
-        if np.allclose(segment, 0.0):
-            continue
+        local_u = relative_velocities[:, 0]
+        local_w = np.sum(z_axes * relative_velocities, axis=1)
+        relative_angles = np.rad2deg(np.arctan2(-local_w, local_u)) + rake_foil_deg
 
-        wave_velocity = wave_velocity_components(wave_array, point_a, eta, time, shared_direction=True)
-        relative_velocity = np.array([eta_dot[0], eta_dot[1], eta_dot[2]], dtype=float) + np.cross(
-            np.array([eta_dot[3], eta_dot[4], eta_dot[5]], dtype=float),
-            point_a,
-        ) - wave_velocity
+        alpha_min = _FOIL_ALPHA[0]
+        alpha_max = _FOIL_ALPHA[-1]
+        in_range = (relative_angles >= alpha_min) & (relative_angles <= alpha_max)
+        alpha_clipped = np.clip(relative_angles, alpha_min, alpha_max)
+        cl = np.where(
+            in_range,
+            np.interp(alpha_clipped, _FOIL_ALPHA, _FOIL_CL),
+            np.sin(2.0 * np.deg2rad(relative_angles)),
+        )
+        cd = np.where(
+            in_range,
+            np.interp(alpha_clipped, _FOIL_ALPHA, _FOIL_CD),
+            2.0 * np.sin(np.deg2rad(relative_angles)) ** 2,
+        )
+        cl[in_range] *= correction_3d
+        cd[in_range] = np.minimum(0.15, cd[in_range])
 
-        y_axis = -segment / np.linalg.norm(segment)
-        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
-        z_axis = np.cross(x_axis, y_axis)
-        z_axis = z_axis / np.linalg.norm(z_axis)
-        y_axis = np.cross(x_axis, z_axis)
-        local_frame = np.column_stack([x_axis, y_axis, z_axis])
-        local_velocity = local_frame @ relative_velocity
+        depth_ratio = np.abs(points_a_world[:, 2] - zero) / max(chord_length, 1e-12)
+        cl_fs = cl * ((1.0 + 16.0 * depth_ratio**2) / (2.0 + 16.0 * depth_ratio**2)) * free_surface_factor
+        relative_speeds = np.hypot(local_u, local_w)
+        dynamic_strip = 0.5 * rho_water * chord_length * relative_speeds**2 * segment_lengths
+        lift_force = dynamic_strip * cl_fs
+        drag_force = dynamic_strip * cd
 
-        segment_length = float(np.linalg.norm(segment))
-        relative_angle = float(np.rad2deg(np.arctan2(-local_velocity[2], local_velocity[0]) - eta[4]) + rake_foil_deg)
-        if submerged[index]:
-            cl, cd = bounded_section_coefficients(relative_angle, _FOIL_ALPHA, _FOIL_CL, _FOIL_CD)
-            if _FOIL_ALPHA[0] <= relative_angle <= _FOIL_ALPHA[-1]:
-                cl = cl * correction_3d
-                cd = min(0.15, cd)
-            depth = abs(point_a[2] - zero)
-            cl_fs = cl * ((1.0 + 16.0 * (depth / chord_length) ** 2) / (2.0 + 16.0 * (depth / chord_length) ** 2)) * free_surface_factor
-            relative_speed = float(np.hypot(local_velocity[0], local_velocity[2]))
+        active = submerged[:-1] & valid_segments
+        total_force[active, 0] = -drag_force[active]
+        total_force[active, :] += lift_force[active, None] * z_axes[active, :]
+        total_moment[active, :] = np.cross(points_a_body[active, :], total_force[active, :])
+        sub_length = float(np.sum(segment_lengths[active]))
 
-            dynamic_strip = 0.5 * rho_water * chord_length * relative_speed**2 * segment_length
-            lift_force = dynamic_strip * cl_fs
-            drag_force = dynamic_strip * cd
-            local_force = np.array([-drag_force, 0.0, lift_force], dtype=float)
-            global_force = np.linalg.inv(local_frame) @ local_force
-            shifted_point = np.array([point_a[0], point_a[1], point_a[2] - eta[2]], dtype=float)
-            total_force[index, :] = global_force
-            total_moment[index, :] = np.cross(shifted_point, global_force)
-            last_cd = cd
-            sub_length += segment_length
+        active_indices = np.flatnonzero(active)
+        if active_indices.size > 0:
+            li = int(active_indices[-1])
+            local_velocity = np.array([local_u[li], 0.0, local_w[li]], dtype=float)
+            relative_velocity = relative_velocities[li, :].copy()
+            relative_angle = float(relative_angles[li])
+            last_cd = float(cd[li])
 
     force_sum = total_force.sum(axis=0)
     moment_sum = total_moment.sum(axis=0)
@@ -195,11 +242,52 @@ def foil_added_mass(sub_length, chord):
 def foil_forces(inputs: FoilInputs):
     points_on = foil_points_onside()
     points_off = foil_points_offside()
+    # shift from raw STL coordinates to simulator body frame (waterline = z=0)
+    points_on[:, 2] += inputs.wl_z_shift
+    points_off[:, 2] += inputs.wl_z_shift
+    points_on_body = _foil_points_body(points_on, inputs.chord_length)
+    points_off_body = _foil_points_body(points_off, inputs.chord_length)
+    rotation_bw = body_to_world_rotation(inputs.eta)
+    translation = np.asarray(inputs.eta[:3], dtype=float)
+    gravity_dir_body = rotation_bw.T @ np.array([0.0, 0.0, -1.0], dtype=float)
+    wave_array = as_wave_array(inputs.wave)
+    points_on_world = points_on_body @ rotation_bw.T + translation
+    points_off_world = points_off_body @ rotation_bw.T + translation
 
-    gravity_on = foil_gravity_force(points_on, inputs.eta, inputs.chord_length)
-    gravity_off = foil_gravity_force(points_off, inputs.eta, inputs.chord_length)
-    hydro_on = hydrofoil_force(inputs.eta_dot, inputs.eta, points_on, inputs.rake_foil_deg, inputs.chord_length, inputs.wave, inputs.time, inputs.zero, reverse_segment=False, free_surface_factor=0.75)
-    hydro_off = hydrofoil_force(inputs.eta_dot, inputs.eta, points_off, inputs.rake_foil_deg, inputs.chord_length, inputs.wave, inputs.time, inputs.zero, reverse_segment=True, free_surface_factor=1.0)
+    gravity_on = _foil_gravity_force_body(points_on_body, gravity_dir_body, inputs.chord_length)
+    gravity_off = _foil_gravity_force_body(points_off_body, gravity_dir_body, inputs.chord_length)
+    hydro_on = hydrofoil_force(
+        inputs.eta_dot,
+        inputs.eta,
+        points_on,
+        inputs.rake_foil_deg,
+        inputs.chord_length,
+        inputs.wave,
+        inputs.time,
+        inputs.zero,
+        reverse_segment=False,
+        free_surface_factor=0.75,
+        wave_array=wave_array,
+        rotation_bw=rotation_bw,
+        points_body=points_on_body,
+        points_world=points_on_world,
+    )
+    hydro_off = hydrofoil_force(
+        inputs.eta_dot,
+        inputs.eta,
+        points_off,
+        inputs.rake_foil_deg,
+        inputs.chord_length,
+        inputs.wave,
+        inputs.time,
+        inputs.zero,
+        reverse_segment=True,
+        free_surface_factor=1.0,
+        wave_array=wave_array,
+        rotation_bw=rotation_bw,
+        points_body=points_off_body,
+        points_world=points_off_world,
+    )
 
     total_gravity = gravity_on + gravity_off
     total_hydrodynamics = hydro_on.force + hydro_off.force
@@ -217,4 +305,8 @@ def foil_forces(inputs: FoilInputs):
         offside_force=hydro_off.force + gravity_off,
         onside_points=points_on,
         offside_points=points_off,
+        onside_points_body=points_on_body,
+        offside_points_body=points_off_body,
+        onside_points_world=points_on_world,
+        offside_points_world=points_off_world,
     )

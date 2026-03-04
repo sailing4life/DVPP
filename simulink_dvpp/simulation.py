@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -11,7 +12,7 @@ from .appendages import appendage_forces
 from .constants import GRAVITY, KNOTS_PER_MPS
 from .diffraction import diffraction_force
 from .gravity import gravity_force
-from .hydrostatics import hydrostatic_forces_and_moments
+from .hydrostatics import build_hydrostatic_mesh_cache, hydrostatic_forces_and_moments
 from .kinematics import body_to_ned_velocity
 from .foils import foil_forces
 from .mass import mass_and_added_mass
@@ -80,7 +81,8 @@ def initial_state_vector(
     return np.concatenate([eta, nu])
 
 
-def load_hull_geometry(hull_file, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG):
+@lru_cache(maxsize=8)
+def _load_hull_geometry_cached(hull_file, waterline_z, mass):
     hull = TriangleMesh.from_file(hull_file)
     if waterline_z is None:
         waterline_z, _ = find_equilibrium_waterline(hull.vectors.copy(), mass=mass)
@@ -91,12 +93,22 @@ def load_hull_geometry(hull_file, waterline_z=None, mass=SIMULINK_DISPLACEMENT_K
     return vertices, faces, float(waterline_z)
 
 
+def load_hull_geometry(hull_file, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG):
+    vertices, faces, cached_waterline = _load_hull_geometry_cached(
+        str(hull_file),
+        None if waterline_z is None else float(waterline_z),
+        float(mass),
+    )
+    return vertices.copy(), faces.copy(), float(cached_waterline)
+
+
 class SimulinkDVPP6DOF:
     def __init__(self, hull_file, dt=0.05, waterline_z=None, mass=SIMULINK_DISPLACEMENT_KG,
                  mainsail_geom=None, jib_geom=None, headsail_geom=None, radiation_data=None,
                  resistance_mode=4):
         self.dt = float(dt)
         self.vertices, self.faces, self.waterline_z = load_hull_geometry(hull_file, waterline_z=waterline_z, mass=mass)
+        self.hydro_cache = build_hydrostatic_mesh_cache(self.vertices, self.faces)
         self.radiation = CumminsRadiationModel(dt=dt)
         if radiation_data is not None:
             self.radiation.inject_solver_data(**radiation_data)
@@ -153,7 +165,15 @@ class SimulinkDVPP6DOF:
         keel_angle_deg,
     ):
         wave = self._wave_state(t, eta, nu, wave_mode, wave_ramp, wave_angle_deg, wave_wind_speed_kn)
-        hydro = hydrostatic_forces_and_moments(self.vertices, self.faces, eta, t, self.zero, wave)
+        hydro = hydrostatic_forces_and_moments(
+            self.vertices,
+            self.faces,
+            eta,
+            t,
+            self.zero,
+            wave,
+            cache=self.hydro_cache,
+        )
         aws_body = apparent_wind_body(tws_kn, twa_deg, nu)
         awa_deg = abs(np.rad2deg(np.arctan2(aws_body[1], aws_body[0])))
 
@@ -176,6 +196,7 @@ class SimulinkDVPP6DOF:
                 time=float(t),
                 keel_angle_deg=float(keel_angle_deg),
                 zero=self.zero,
+                wl_z_shift=-self.waterline_z,
             )
         )
         foil_outputs = foil_forces(
@@ -186,6 +207,7 @@ class SimulinkDVPP6DOF:
                 wave=wave,
                 time=float(t),
                 zero=self.zero,
+                wl_z_shift=-self.waterline_z,
             )
         )
         if use_foil:

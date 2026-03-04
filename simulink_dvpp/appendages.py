@@ -39,10 +39,11 @@ _KEEL_CD = np.array([
     0.04348, 0.05243, 0.06378, 0.0774, 0.09561, 0.11887, 0.26127, 0.27522, 0.28448, 0.30184, 0.31559, 0.32603, 0.34263, 0.3568,
     0.37067, 0.38264, 0.39333, 0.41212, 0.42713, 0.44093, 0.45239, 0.46371, 0.48249, 0.49616,
 ], dtype=float)
+# z-values in raw STL coordinates; wl_z_shift = -waterline_z applied at call time in appendage_forces()
 _KEEL_POINTS = np.column_stack([
     np.full(151, -0.037595, dtype=float),
     np.zeros(151, dtype=float),
-    np.linspace(-0.260201, -4.101993, 151, dtype=float) + 0.406,
+    np.linspace(-0.260201, -4.101993, 151, dtype=float),
 ])
 
 
@@ -283,6 +284,8 @@ def distributed_keel_force(
 
 def appendage_forces(inputs: AppendageInputs):
     points = keel_points()
+    # shift from raw STL coordinates to simulator body frame (waterline = z=0)
+    points[:, 2] += inputs.wl_z_shift
     points_body = _keel_points_body(points, inputs.keel_angle_deg)
     rotation_bw = body_to_world_rotation(inputs.eta)
     translation = np.asarray(inputs.eta[:3], dtype=float)

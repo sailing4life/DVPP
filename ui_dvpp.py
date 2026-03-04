@@ -24,9 +24,13 @@ import os, sys, time, tempfile
 # ── project modules ──────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from panel_solver   import PanelSolver
+import plotly.graph_objects as go
 from simulink_dvpp import SIMULINK_DISPLACEMENT_KG, run_simulation, build_solver, SteadyStateResult
 from simulink_dvpp.constants import KNOTS_PER_MPS
 from simulink_dvpp.kinematics import body_to_world_rotation
+from simulink_dvpp.simulation import load_hull_geometry
+from simulink_dvpp.foils import foil_points_onside, foil_points_offside
+from simulink_dvpp.appendages import keel_points
 from simulink_dvpp.radiation import DEFAULT_OMEGA as _NEMOH_OMEGA, DEFAULT_B33 as _NEMOH_B33
 from orc_dxt import parse_dxt
 from validate_sphere import _retardation_kernel, _simulate_cummins, _analytical_drop
@@ -54,6 +58,7 @@ for key, default in [
     ('t_vals',       None),
     ('y_vals',       None),
     ('sim_outputs',  None),
+    ('sim_hull_path', None),
     ('mass_kg',      float(SIMULINK_DISPLACEMENT_KG)),
     ('drop_done',    False),
     ('drop_results', None),
@@ -166,6 +171,136 @@ def _results_dataframe(t_vals, y_vals, force_arrays, force_arrays_world):
                 df[f"{prefix}_{label}"] = padded[:, idx]
 
     return df
+
+
+def _build_boat_3d_figure(hull_path, waterline_z, mass_kg, eta, keel_angle_deg=0.0, rake_foil_deg=4.0):
+    """Build a Plotly 3D figure of the boat at the given eta pose.
+
+    All geometry is in the simulator body frame (waterline at z=0), then
+    rotated to the world frame using the body-to-world rotation R(eta).
+
+    Parameters
+    ----------
+    hull_path : str
+        Path to the hull STL file.
+    waterline_z : float
+        Waterline z in the original STL coordinate system [m].
+    mass_kg : float
+        Vessel displacement mass [kg].
+    eta : array_like, shape (6,)
+        Pose vector [x, y, z, phi, theta, psi].
+    keel_angle_deg : float
+        Keel cant angle (positive = windward).
+    rake_foil_deg : float
+        Foil rake angle [deg].
+    """
+    from simulink_dvpp.rotations import rotx
+
+    eta = np.asarray(eta, dtype=float)
+    translation = eta[:3]
+    R = body_to_world_rotation(eta)
+    wl_shift = -waterline_z
+
+    def body_to_world(pts_body):
+        pts = np.asarray(pts_body, dtype=float)
+        return pts @ R.T + translation
+
+    fig = go.Figure()
+
+    # ── 1. Hull mesh ──────────────────────────────────────────────────────────
+    try:
+        verts, faces, _ = load_hull_geometry(hull_path, waterline_z=waterline_z, mass=mass_kg)
+        verts_w = body_to_world(verts)
+        fig.add_trace(go.Mesh3d(
+            x=verts_w[:, 0], y=verts_w[:, 1], z=verts_w[:, 2],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color='steelblue', opacity=0.35, flatshading=False,
+            name='Hull', showscale=False, showlegend=True,
+        ))
+    except Exception:
+        pass
+
+    # ── 2. Waterline plane ────────────────────────────────────────────────────
+    half = 8.0
+    wl_corners_body = np.array([
+        [-half, -half, 0.0],
+        [ half, -half, 0.0],
+        [ half,  half, 0.0],
+        [-half,  half, 0.0],
+    ])
+    wl_w = body_to_world(wl_corners_body)
+    fig.add_trace(go.Mesh3d(
+        x=wl_w[:, 0], y=wl_w[:, 1], z=wl_w[:, 2],
+        i=[0, 0], j=[1, 2], k=[2, 3],
+        color='cyan', opacity=0.18,
+        name='Waterline', showlegend=True,
+    ))
+
+    # ── 3. Keel ───────────────────────────────────────────────────────────────
+    keel_pts = keel_points()
+    keel_pts[:, 2] += wl_shift
+    # apply cant rotation (positive = windward, i.e. rotx(-angle))
+    from simulink_dvpp.rotations import rotx as _rotx
+    cant_rot = _rotx(-float(keel_angle_deg))
+    keel_pts_body = keel_pts @ cant_rot.T
+    keel_w = body_to_world(keel_pts_body)
+    fig.add_trace(go.Scatter3d(
+        x=keel_w[:, 0], y=keel_w[:, 1], z=keel_w[:, 2],
+        mode='lines', line=dict(color='saddlebrown', width=4),
+        name='Keel fin',
+    ))
+    # Bulb: sphere centred on rotated bulb position
+    bulb_arm = 4.1
+    bulb_pos_body = cant_rot @ np.array([0.0, 0.0, -bulb_arm + wl_shift])
+    # offset the keel attachment point (root is at x=-0.037595)
+    bulb_pos_body[0] += -0.037595
+    bulb_w = body_to_world(bulb_pos_body[None, :])[0]
+    u_s = np.linspace(0, 2 * np.pi, 12)
+    v_s = np.linspace(0, np.pi, 8)
+    r_b = 0.35
+    bx = bulb_w[0] + r_b * np.outer(np.cos(u_s), np.sin(v_s))
+    by = bulb_w[1] + r_b * np.outer(np.sin(u_s), np.sin(v_s))
+    bz = bulb_w[2] + r_b * np.outer(np.ones_like(u_s), np.cos(v_s))
+    fig.add_trace(go.Surface(
+        x=bx, y=by, z=bz,
+        colorscale=[[0, 'saddlebrown'], [1, 'saddlebrown']],
+        showscale=False, opacity=0.85, name='Bulb', showlegend=True,
+    ))
+
+    # ── 4. Foils ──────────────────────────────────────────────────────────────
+    for pts_raw, label, color in [
+        (foil_points_onside(), 'Foil (onside)', '#9333ea'),
+        (foil_points_offside(), 'Foil (offside)', '#c084fc'),
+    ]:
+        pts = pts_raw.copy()
+        pts[:, 2] += wl_shift
+        pts_w = body_to_world(pts)
+        fig.add_trace(go.Scatter3d(
+            x=pts_w[:, 0], y=pts_w[:, 1], z=pts_w[:, 2],
+            mode='lines+markers',
+            line=dict(color=color, width=5),
+            marker=dict(size=3, color=color),
+            name=label,
+        ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    phi_deg = float(np.rad2deg(eta[3]))
+    theta_deg = float(np.rad2deg(eta[4]))
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='x — surge (m)',
+            yaxis_title='y — sway (m)',
+            zaxis_title='z — heave (m)',
+            aspectmode='data',
+            camera=dict(eye=dict(x=-1.5, y=-1.5, z=0.8)),
+        ),
+        title=f'Boat pose — heel {phi_deg:.1f}°, trim {theta_deg:.1f}°',
+        margin=dict(l=0, r=0, t=36, b=0),
+        legend=dict(x=0.01, y=0.99),
+        height=600,
+    )
+    return fig
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
@@ -597,6 +732,8 @@ with tab2:
                 st.session_state.sim_outputs = sim_outputs
                 st.session_state.sim_done = True
                 st.session_state.mass_kg = float(sim_mass_kg)
+                st.session_state.sim_hull_path = hull_path
+                st.session_state.sim_keel_angle_deg = float(keel_angle_deg)
                 st.success(f"Simulation complete in {elapsed:.1f}s. Waterline z = {sim_outputs.waterline_z:.3f} m")
             except Exception as e:
                 st.error(f"Simulation error: {e}")
@@ -853,6 +990,41 @@ with tab3:
             ax.legend(ncols=3, fontsize=9)
             st.pyplot(fig)
             plt.close(fig)
+
+        # ── 3D Boat Visualisation ─────────────────────────────────────────────
+        st.subheader("3D Boat Visualisation")
+        vis_hull_path = st.session_state.get('sim_hull_path') or os.path.join(os.path.dirname(__file__), "PRB F.stl")
+        if os.path.exists(vis_hull_path):
+            n_steps = len(t_vals)
+            vis_step = st.slider(
+                "Time step",
+                min_value=0,
+                max_value=n_steps - 1,
+                value=n_steps - 1,
+                format=f"t = %d × {sim_outputs.t_vals[1] - sim_outputs.t_vals[0]:.2f}s",
+                key="vis_step_slider",
+            )
+            vis_eta = y_vals[vis_step, :6]
+            vis_keel = float(st.session_state.get('sim_keel_angle_deg', 0.0))
+            st.caption(
+                f"t = {t_vals[vis_step]:.2f} s  |  "
+                f"heel = {float(np.rad2deg(vis_eta[3])):.1f}°  |  "
+                f"trim = {float(np.rad2deg(vis_eta[4])):.1f}°  |  "
+                f"heave = {float(vis_eta[2]):.3f} m"
+            )
+            try:
+                fig3d = _build_boat_3d_figure(
+                    hull_path=vis_hull_path,
+                    waterline_z=sim_outputs.waterline_z,
+                    mass_kg=float(st.session_state.mass_kg),
+                    eta=vis_eta,
+                    keel_angle_deg=vis_keel,
+                )
+                st.plotly_chart(fig3d, use_container_width=True)
+            except Exception as exc:
+                st.warning(f"3D visualisation unavailable: {exc}")
+        else:
+            st.info("Hull STL not found — 3D visualisation unavailable.")
 
         df = _results_dataframe(t_vals, y_vals, force_arrays, force_arrays_world)
         csv = df.to_csv(index=False)
